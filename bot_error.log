@@ -1,0 +1,6 @@
+C:\Users\frixsis\Desktop\PocketSignalBot\main.py:188: DeprecationWarning: 'asyncio.WindowsSelectorEventLoopPolicy' is deprecated and slated for removal in Python 3.16
+  asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+C:\Users\frixsis\Desktop\PocketSignalBot\main.py:188: DeprecationWarning: 'asyncio.set_event_loop_policy' is deprecated and slated for removal in Python 3.16
+  asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+2026-10-11 06:53:31,426 | INFO | __main__ | Telegram connection routed through proxy: socks5://127.0.0.1:40000
+2026-10-11 06:53:31,427 | WARNING | __main__ | ANTHROPIC_API_KEY отсутствует или не похож на настоящий ключ Anthropic (должен начинаться с 'sk-ant-') — комментарий ИИ-аналитика отключён. Режим «\U0001f9e0 Авто» работает без него.

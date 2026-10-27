@@ -1,0 +1,32 @@
+aiogram>=3.13,<4
+# Only actually used if TELEGRAM_PROXY_URL is set in .env (socks5://... -
+# e.g. Cloudflare WARP in Proxy Mode, see README "Работа без ручного VPN").
+# aiogram's AiohttpSession needs this to build a SOCKS proxy connector -
+# without it, setting TELEGRAM_PROXY_URL makes the bot fail immediately at
+# startup with "In order to use aiohttp client for proxy requests, install
+# https://pypi.org/project/aiohttp-socks/".
+aiohttp-socks>=0.9,<1
+httpx>=0.27,<1
+pydantic>=2.7,<3
+pydantic-settings>=2.4,<3
+
+# Unofficial Pocket Option WebSocket client (no official API exists).
+# Prebuilt manylinux/abi3 wheels exist for Python 3.10-3.12 — no Rust
+# toolchain needed to install.
+binaryoptionstoolsv2>=0.2.11,<1
+
+# Claude second-opinion review (ai/) and async SQLite persistence (storage/).
+anthropic>=0.34,<2
+aiosqlite>=0.20,<1
+
+# dev / tests
+pytest>=8.2,<9
+pytest-asyncio>=0.23,<1
+respx>=0.21,<1
+
+# NOT installed by default (deliberately not listed above): playwright, for
+# scripts/capture_ssid_playwright.py only. It's an optional one-off helper
+# for getting POCKET_OPTION_SSID, not something the bot itself needs to run.
+# If you want that script:
+#   pip install playwright
+#   playwright install chromium
