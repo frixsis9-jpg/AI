@@ -1,0 +1,23 @@
+services:
+  bot:
+    build: .
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./docker-data
+        target: /data
+    environment:
+      DATABASE_PATH: /data/signals.db
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
