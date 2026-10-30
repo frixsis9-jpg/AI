@@ -12,3 +12,5 @@ __pycache__
 *.pyc
 .pytest_cache
 docker-data
+PocketOptionSSID.exe
+tools/ssid-helper
