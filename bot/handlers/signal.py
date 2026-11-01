@@ -59,7 +59,7 @@ _DIRECTION_TEXT = {"CALL": "🟢 ВВЕРХ (CALL)", "PUT": "🔴 ВНИЗ (PUT)
 _MAX_NOTES = 4
 
 
-@router.callback_query(SignalSetup.menu, F.data == "menu:signal")
+@router.callback_query(F.data == "menu:signal")
 async def get_signal(
     callback: CallbackQuery,
     state: FSMContext,

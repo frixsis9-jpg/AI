@@ -24,7 +24,9 @@ async def _show_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
 
 # --- opening a sub-menu -------------------------------------------------
 
-@router.callback_query(SignalSetup.menu, F.data == "menu:pair")
+# Callback payloads identify these actions even when MemoryStorage was cleared
+# by a restart. Old Telegram keyboards must remain usable without /start.
+@router.callback_query(F.data == "menu:pair")
 async def open_pair_menu(
     callback: CallbackQuery, state: FSMContext, provider: MarketDataProvider
 ) -> None:
@@ -36,7 +38,7 @@ async def open_pair_menu(
     await callback.answer()
 
 
-@router.callback_query(SignalSetup.menu, F.data == "menu:expiration")
+@router.callback_query(F.data == "menu:expiration")
 async def open_expiration_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SignalSetup.choosing_expiration)
     await safe_edit_text(callback.message, "Выберите время экспирации:", expiration_keyboard())
@@ -45,7 +47,7 @@ async def open_expiration_menu(callback: CallbackQuery, state: FSMContext) -> No
 
 # --- making a choice inside a sub-menu ----------------------------------
 
-@router.callback_query(SignalSetup.choosing_pair, F.data.startswith("pair:"))
+@router.callback_query(F.data.startswith("pair:"))
 async def choose_pair(
     callback: CallbackQuery, state: FSMContext, provider: MarketDataProvider | None = None
 ) -> None:
@@ -70,7 +72,7 @@ async def noop(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(SignalSetup.choosing_expiration, F.data.startswith("exp:"))
+@router.callback_query(F.data.startswith("exp:"))
 async def choose_expiration(callback: CallbackQuery, state: FSMContext) -> None:
     name = callback.data.split(":", 1)[1]
     if name == AUTO:
