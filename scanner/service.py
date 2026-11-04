@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
 
-from analysis.entry import VERSION, age_limit, evaluate
+from analysis.entry import VERSION, EntryRejected, age_limit, evaluate
 from analysis.errors import AnalysisError
 from analysis.multi_timeframe import timeframe_trio_for
 from domain import REGULAR_PAIRS, CurrencyPair, Expiration
@@ -71,6 +71,9 @@ class SearchManager:
         self.locks = {}
         self.statuses = {}
         self.cooldowns = {}
+        self.progress = {}
+        self.last_progress = {}
+        self.checks = {}
         self.analysis_lock = asyncio.Lock()
 
     def status(self, chat, user):
@@ -93,13 +96,17 @@ class SearchManager:
             except asyncio.CancelledError:
                 pass
         self.statuses[key] = "Поиск остановлен"
+        self.progress.pop(key, None)
 
-    async def start(self, chat, user, options, *, once=False):
+    async def start(self, chat, user, options, *, once=False, progress=None):
         options.validate()
         key = (chat, user)
         async with self.locks.setdefault(key, asyncio.Lock()):
             await self._stop(key)
-            self.statuses[key] = "Проверяю активные пары и прогреваю историю"
+            self.progress[key] = progress
+            self.last_progress[key] = 0
+            self.checks[key] = 0
+            self.statuses[key] = "Загружаю данные активных пар"
             self.tasks[key] = asyncio.create_task(
                 self._run(key, options, once), name=f"search:{chat}:{user}"
             )
@@ -107,6 +114,38 @@ class SearchManager:
     async def close(self):
         for key in list(self.tasks):
             await self.stop(*key)
+
+    async def _show_progress(self, key, options, *, active=True, force=False):
+        progress = self.progress.get(key)
+        if not progress or (
+            not force and self.clock() - self.last_progress.get(key, 0) < 15
+        ):
+            return
+        message_id, active_markup, idle_markup = progress
+        self.last_progress[key] = self.clock()
+        mode = "Ручной сигнал" if options.mode == "manual" else "Автопоиск"
+        pair = (
+            f" · {options.pair.label}"
+            if options.mode == "manual" and options.pair
+            else ""
+        )
+        text = (
+            f"{mode}{pair} · {options.expiration.label}\n\n{self.statuses[key]}"
+            f"\n\nПоследняя проверка: {self._time(self.clock())}. Проверено ситуаций: {self.checks.get(key, 0)}."
+        )
+        try:
+            await asyncio.wait_for(
+                self.bot.edit_message_text(
+                    chat_id=key[0],
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=active_markup if active else idle_markup,
+                    parse_mode=None,
+                ),
+                timeout=2,
+            )
+        except (TimeoutError, TelegramAPIError):
+            logger.debug("Progress message could not be edited")
 
     async def _notify(self, key, text):
         # Parse mode is explicitly plain text; broker symbols cannot inject HTML.
@@ -156,6 +195,7 @@ class SearchManager:
     async def _run(self, key, options, once):
         started = self.clock()
         pending = None
+        cycles = 0
         try:
             await self._event(
                 key, "started", options, mode=options.mode, market=options.market
@@ -175,8 +215,13 @@ class SearchManager:
                     candidates = []
                     failures = []
                     for pair in group:
+                        self.statuses[key] = (
+                            f"⏳ Загружаю и проверяю свечи {pair.label}…"
+                        )
+                        await self._show_progress(key, options, force=cycles == 0)
                         try:
                             c = await self.inspect(pair, options.expiration)
+                            self.checks[key] = self.checks.get(key, 0) + 1
                             token = (
                                 key,
                                 str(pair),
@@ -186,7 +231,33 @@ class SearchManager:
                             if self.clock() >= self.cooldowns.get(token, 0):
                                 candidates.append(c)
                         except (MarketDataError, AnalysisError, TimeoutError) as exc:
-                            failures.append(f"{pair.label}: {exc}")
+                            self.checks[key] = self.checks.get(key, 0) + 1
+                            prefix = (
+                                "Ситуация проверена, входа нет"
+                                if isinstance(exc, EntryRejected)
+                                else "Данные ещё не готовы"
+                            )
+                            reason = str(exc) or "источник данных не ответил вовремя"
+                            detail = f"{prefix}. {pair.label}: {reason}"
+                            if (
+                                once
+                                and options.mode == "manual"
+                                and isinstance(exc, EntryRejected)
+                                and exc.result is not None
+                            ):
+                                r = exc.result
+                                bias = (
+                                    "ВВЕРХ" if r.final_direction == "CALL" else "ВНИЗ"
+                                )
+                                detail = (
+                                    f"Анализ выполнен. Смещение модели: {bias}.\nВход сейчас НЕ подтверждён.\nПричина: {reason}\n"
+                                    f"Таймфреймы согласны: {r.agreement}/{r.analyzed_count}."
+                                )
+                                detail += "\n" + "\n".join(
+                                    f"• [{n.timeframe.value}] {n.text}"
+                                    for n in r.pros[:2]
+                                )
+                            failures.append(detail)
                     if candidates:
                         selected = max(candidates, key=lambda c: c.quality)
                         # Another asset may have needed a slow history request.
@@ -211,23 +282,27 @@ class SearchManager:
                         )
                         pending = None
                     else:
-                        self.statuses[key] = "Ожидаю подходящий вход. " + (
+                        self.statuses[key] = (
                             failures[0]
                             if failures
                             else "Повторный сигнал временно заблокирован"
                         )
-                        if once:
+                        if once and not self.progress.get(key):
                             await self._notify(key, self.statuses[key])
+                    if once and self.statuses[key].startswith("Вход зафиксирован"):
+                        self.statuses[key] = "Разовый план выполнен. Поиск остановлен"
+                    await self._show_progress(key, options, active=not once, force=True)
+                    cycles += 1
                     if once:
-                        if self.statuses[key].startswith("Вход зафиксирован"):
-                            self.statuses[key] = (
-                                "Разовый план выполнен. Поиск остановлен"
-                            )
                         return
                 except (MarketDataError, TimeoutError) as exc:
-                    self.statuses[key] = str(exc)
+                    self.statuses[key] = "Данные не готовы: " + (
+                        str(exc) or "источник не ответил вовремя"
+                    )
+                    await self._show_progress(key, options, active=not once, force=True)
                     if once:
-                        await self._notify(key, "⏳ " + str(exc))
+                        if not self.progress.get(key):
+                            await self._notify(key, "⏳ " + self.statuses[key])
                         return
                 await self.sleep(self.policy.interval)
         except asyncio.CancelledError:

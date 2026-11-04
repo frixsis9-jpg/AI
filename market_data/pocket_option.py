@@ -92,13 +92,11 @@ class SupportsPocketOptionClient(Protocol):
 
     async def subscribe_symbol(self, asset: str): ...
 
-    async def compile_candles(
-        self, asset: str, period: int, lookback: int
+    async def get_candles_advanced(
+        self, asset: str, period: int, offset: int, time: int
     ) -> list[dict]: ...
 
-    async def candles(
-        self, asset: str, period: int, count: int, end_time: int
-    ) -> list[dict]: ...
+    async def get_ticks(self, asset: str, lookback_seconds: int) -> list: ...
 
     async def history(self, asset: str, period: int) -> list[dict]: ...
 
@@ -242,7 +240,26 @@ class PocketOptionProvider(MarketDataProvider):
         self, pair: CurrencyPair, timeframes, output_size: int = 121
     ) -> MarketSnapshot:
         feed = await self._ensure_feed(pair)
-        if feed.last_price is None or feed.feed_now is None:
+        deadline = time.monotonic() + 10
+        while (
+            not feed.closed
+            and not feed.backfill_attempted.is_set()
+            and time.monotonic() < deadline
+        ):
+            enough = all(
+                sum(
+                    c.is_closed
+                    for c in feed.candles(
+                        tf.seconds, tf.pocket_option_base.period_seconds
+                    )
+                )
+                >= 120
+                for tf in timeframes
+            )
+            if enough:
+                break  # short requests need not wait for unrelated H1 backfill
+            await asyncio.sleep(0.05)
+        if feed.closed or feed.last_price is None or feed.feed_now is None:
             raise FeedUnavailableError(self._no_quotes_message(pair))
         # No awaits between candle/tick reads: one consistent event-loop snapshot.
         now = time.time()

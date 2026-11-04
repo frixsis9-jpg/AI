@@ -17,6 +17,15 @@ from domain import Expiration
 from market_data.models import MarketDataError
 from market_data.snapshot import MarketSnapshot
 
+
+class EntryRejected(MarketDataError):
+    """Inputs are ready, but entry conditions are not satisfied."""
+
+    def __init__(self, reason, result=None):
+        super().__init__(reason)
+        self.result = result
+
+
 VERSION = "entry-v1"
 
 
@@ -51,17 +60,21 @@ def evaluate(snapshot: MarketSnapshot, expiration: Expiration) -> Candidate:
     result = analyze_multi_timeframe(
         snapshot.pair, expiration, snapshot.candles, snapshot.price
     )
+
+    def reject(reason):
+        return EntryRejected(reason, result)
+
     if result.analyzed_count != 3 or result.agreement < 2:
-        raise MarketDataError("Таймфреймы противоречат друг другу")
+        raise reject("Таймфреймы противоречат друг другу")
     if abs(result.logit) < 0.20:
-        raise MarketDataError("Перевес модели слишком слабый; продолжаю наблюдение")
+        raise reject("Перевес модели слишком слабый; продолжаю наблюдение")
     primary = result.primary
     atr = primary.indicators.atr
     if not math.isfinite(atr) or atr <= 0:
-        raise MarketDataError("Недостаточная волатильность")
+        raise reject("Недостаточная волатильность")
     ratio = primary.indicators.atr_ratio
     if ratio < 0.65 or ratio > 1.8:
-        raise MarketDataError("Слишком тихий рынок или всплеск волатильности")
+        raise reject("Слишком тихий рынок или всплеск волатильности")
     sign = 1 if result.final_direction == "CALL" else -1
     opposing = "resistance" if sign > 0 else "support"
     opposing_levels = [
@@ -70,13 +83,13 @@ def evaluate(snapshot: MarketSnapshot, expiration: Expiration) -> Candidate:
     level = nearest_level(opposing_levels, snapshot.price, opposing)
     room = abs(level.price - snapshot.price) / atr if level else 3.0
     if level and room < 0.35:
-        raise MarketDataError("Противоположный уровень слишком близко к цене входа")
+        raise reject("Противоположный уровень слишком близко к цене входа")
     closed = [c for c in snapshot.candles[primary.timeframe] if c.is_closed]
     if abs(snapshot.price - closed[-1].close) > 1.5 * atr:
-        raise MarketDataError("Цена уже ушла далеко; запоздалый вход пропущен")
+        raise reject("Цена уже ушла далеко; запоздалый вход пропущен")
     forming = [c for c in snapshot.candles[primary.timeframe] if not c.is_closed]
     if forming and (snapshot.price - forming[-1].open) * sign < -0.2 * atr:
-        raise MarketDataError("Текущая свеча движется против направления")
+        raise reject("Текущая свеча движется против направления")
     window = min(30.0, max(3.0, expiration.value / 2))
     ticks = [
         (t, p)
@@ -87,14 +100,14 @@ def evaluate(snapshot: MarketSnapshot, expiration: Expiration) -> Candidate:
         len(ticks) < (8 if expiration.is_short else 3)
         or ticks[-1][0] - ticks[0][0] < window * 0.5
     ):
-        raise MarketDataError("Поток ещё прогревается: недостаточно свежих тиков")
+        raise reject("Поток ещё прогревается: недостаточно свежих тиков")
     movement = (ticks[-1][1] - ticks[0][1]) * sign
     if movement <= 0:
-        raise MarketDataError("Последние тики не подтверждают направление")
+        raise reject("Последние тики не подтверждают направление")
     path = sum(abs(b[1] - a[1]) for a, b in zip(ticks, ticks[1:]))
     efficiency = movement / path if path else 0
     if expiration.is_short and efficiency < 0.25:
-        raise MarketDataError("Тики слишком хаотичны для секундной экспирации")
+        raise reject("Тики слишком хаотичны для секундной экспирации")
     quality = (
         20 * result.agreement
         + min(20, abs(result.logit) * 20)

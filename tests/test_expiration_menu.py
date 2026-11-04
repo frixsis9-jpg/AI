@@ -1,6 +1,11 @@
 from analysis.multi_timeframe import timeframe_trio_for
 from analyst.advisor import LADDER
-from bot.keyboards import expiration_keyboard, main_menu_keyboard
+from bot.keyboards import (
+    expiration_keyboard,
+    main_menu_keyboard,
+    settings_keyboard,
+    workspace_keyboard,
+)
 from bot.rendering import parse_selection
 from domain import Expiration, Timeframe
 
@@ -54,12 +59,17 @@ def test_second_profile_and_existing_minute_profiles_are_separate():
     actions = [
         b.callback_data for row in main_menu_keyboard().inline_keyboard for b in row
     ]
-    for action in (
-        "menu:pair",
-        "mode:auto",
-        "menu:expiration",
-        "search:start",
-        "search:stop",
-        "search:status",
-    ):
-        assert action in actions
+    assert actions == ["menu:manual", "mode:auto"]
+    manual = [
+        b.callback_data for row in workspace_keyboard({}).inline_keyboard for b in row
+    ]
+    assert manual == ["menu:pair", "menu:expiration", "menu:signal", "menu:home"]
+    auto = [
+        b.callback_data
+        for row in workspace_keyboard({"pair_mode": "auto"}).inline_keyboard
+        for b in row
+    ]
+    assert auto == ["menu:expiration", "search:start", "menu:settings", "menu:home"]
+    assert "menu:watchlist" in [
+        b.callback_data for row in settings_keyboard().inline_keyboard for b in row
+    ]

@@ -286,3 +286,44 @@ def test_message_keeps_existing_factor_explanations_without_claiming_probability
     assert "test explanation" in text
     assert "не вероятность выигрыша" in text
     assert "62%" not in text
+
+
+@pytest.mark.asyncio
+async def test_manual_check_shows_why_no_entry_without_endless_wait(
+    setup, candidate_factory
+):
+    from analysis.entry import EntryRejected
+
+    m, p, b, repo, clock = setup
+    c = candidate_factory(now=clock())
+    m.inspect.side_effect = EntryRejected("Перевес слишком слабый", c.result)
+    m.progress[(1, 2)] = (7, "active_markup", "idle_markup")
+    m.last_progress[(1, 2)] = 0
+    b.edit_message_text = AsyncMock()
+    await m._run(
+        (1, 2), SearchOptions(Expiration.MIN_3, pair=CurrencyPair("EURUSD")), True
+    )
+    text = b.edit_message_text.call_args.kwargs["text"]
+    assert "Анализ выполнен" in text and "НЕ подтверждён" in text
+    assert "Последняя проверка" in text
+    assert b.edit_message_text.call_args.kwargs["reply_markup"] == "idle_markup"
+    repo.save_signal.assert_not_awaited()
+    b.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_data_wait_is_visible_and_not_described_as_a_market_entry(setup):
+    from market_data.models import MarketDataError
+
+    m, p, b, repo, clock = setup
+    m.inspect.side_effect = MarketDataError("1M: история догружается (0/120 свечей)")
+    m.progress[(1, 2)] = (7, "active", "idle")
+    m.last_progress[(1, 2)] = 0
+    b.edit_message_text = AsyncMock()
+    await m._run(
+        (1, 2), SearchOptions(Expiration.MIN_3, pair=CurrencyPair("EURUSD")), True
+    )
+    text = b.edit_message_text.call_args.kwargs["text"]
+    assert "Данные ещё не готовы" in text and "0/120" in text
+    assert "Ожидаю подходящий вход" not in text
+    repo.save_signal.assert_not_awaited()

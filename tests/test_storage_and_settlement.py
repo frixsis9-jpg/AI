@@ -120,7 +120,7 @@ async def test_cancel_during_history_start_explicitly_unsubscribes():
         started.set()
         await asyncio.Event().wait()
 
-    client.compile_candles = hold
+    client.get_candles_advanced = hold
     p = PocketOptionProvider("dummy", client=client)
     task = asyncio.create_task(p._ensure_feed(CurrencyPair("EURUSD")))
     await asyncio.wait_for(started.wait(), 1)

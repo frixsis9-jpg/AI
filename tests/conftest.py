@@ -16,9 +16,10 @@ from market_data.snapshot import MarketSnapshot
 def snapshot_factory():
     def make(exp=Expiration.MIN_3, now=None, pair="EURUSD", direction=1):
         now = time.time() if now is None else now
+        tick_time = now - 0.1
         candles = {}
         for tf in timeframe_trio_for(exp):
-            end = int(now) // tf.seconds * tf.seconds
+            end = int(tick_time) // tf.seconds * tf.seconds
             rows = []
             for i in range(120):
                 price = 1.1 + 0.0001 * math.sin(i * 0.4)
@@ -49,7 +50,7 @@ def snapshot_factory():
             for i in range(300)
         )
         return MarketSnapshot(
-            CurrencyPair(pair), now, now - 0.1, 0.1, 1.1001, candles, ticks
+            CurrencyPair(pair), now, tick_time, 0.1, 1.1001, candles, ticks
         )
 
     return make

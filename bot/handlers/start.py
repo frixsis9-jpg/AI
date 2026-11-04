@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot.keyboards import main_menu_keyboard
-from bot.rendering import render_menu_text
+from bot.rendering import render_home_text
 from bot.states import SignalSetup
 
 logger = logging.getLogger(__name__)
@@ -27,5 +27,4 @@ async def cmd_start(message: Message, state: FSMContext, search=None) -> None:
         await search.stop(message.chat.id, message.from_user.id)
     await state.set_state(SignalSetup.menu)
     # Keep persisted selections; /start only opens the menu and stops old jobs.
-    data = await state.get_data()
-    await message.answer(render_menu_text(data), reply_markup=main_menu_keyboard())
+    await message.answer(render_home_text(), reply_markup=main_menu_keyboard())

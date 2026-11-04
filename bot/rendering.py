@@ -20,31 +20,21 @@ def parse_selection(data):
     return pair, expiration
 
 
+def render_home_text():
+    return "Выберите режим:\n\n💱 Ручной сигнал — выберите пару и экспирацию, затем нажмите «Получить сигнал».\n🔎 Автопоиск — бот сам ищет пару под вашу экспирацию."
+
+
 def render_menu_text(data):
     pair, expiration = parse_selection(data)
-    mode = (
-        "🔎 Автовыбор пары"
-        if data.get("pair_mode") == "auto"
-        else "💱 Ручной выбор пары"
-    )
-    market = {"both": "Обычные + OTC", "regular": "Обычные", "otc": "OTC"}.get(
-        data.get("market", "both"), "Обычные + OTC"
-    )
-    pair_text = (
-        "автопоиск"
-        if data.get("pair_mode") == "auto"
-        else pair.label
-        if pair
-        else "не выбрана"
-    )
-    watch = data.get("watchlist", [])
-    return (
-        "Настройка поиска входа:\n\n"
-        f"Режим: {mode}\nПара: {pair_text}\n"
-        f"Экспирация: {expiration.label if expiration else 'выберите время'}\n"
-        f"Рынок автопоиска: {market}\nСписок автопоиска: {str(len(watch)) + ' пар' if watch else 'все доступные основные пары'}\n\n"
-        "Выберите экспирацию и пару либо автовыбор. Нажмите «Начать поиск».\n"
-        "При слабых условиях бот ждёт. План входа предварительный до подтверждения.\n"
-        "5–30 секунд — экспериментальный режим; время ручного входа критично.\n"
-        "После перезапуска настройки сохраняются, поиск запускается кнопкой.\n/stats — модельные результаты, а не ваши реальные сделки."
-    )
+    exp = expiration.label if expiration else "не выбрана"
+    if data.get("pair_mode") == "auto":
+        market = {"both": "Обычные + OTC", "regular": "Обычные пары", "otc": "OTC"}.get(
+            data.get("market", "both"), "Обычные + OTC"
+        )
+        count = len(data.get("watchlist", []))
+        text = f"🔎 Автопоиск\n\n⌛ Экспирация: {exp}\n🌐 Рынок: {market}\nПары: {str(count) + ' выбранных' if count else 'основной список'}\n\nНажмите «Начать автопоиск». Ход проверки появится здесь."
+    else:
+        text = f"💱 Ручной сигнал\n\nПара: {pair.label if pair else 'не выбрана'}\n⌛ Экспирация: {exp}\n\nНажмите «Получить сигнал». Бот проверит именно эту пару."
+    if expiration and expiration.is_short:
+        text += "\n\n5–30 секунд — экспериментальный режим."
+    return text

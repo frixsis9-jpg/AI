@@ -54,7 +54,16 @@ async def test_old_keyboards_work_with_empty_state_and_across_submenus():
         return [call.args[1] for call in session.call_args_list]
 
     try:
-        # The main menu still opens after all in-memory state was lost.
+        # The home has two choices. Manual mode walks pair -> expiry -> signal.
+        methods = await click("menu:home")
+        home = next(m for m in methods if isinstance(m, EditMessageText))
+        assert len([b for row in home.reply_markup.inline_keyboard for b in row]) == 2
+        methods = await click("menu:manual")
+        assert any(
+            isinstance(m, EditMessageText) and "Шаг 1" in m.text for m in methods
+        )
+
+        # Old callbacks also remain usable after in-memory state was lost.
         methods = await click("menu:pair")
         assert await state.get_state() == SignalSetup.choosing_pair.state
         assert any(
@@ -71,7 +80,7 @@ async def test_old_keyboards_work_with_empty_state_and_across_submenus():
         await state.clear()
         await click("pair:EURUSD")
         assert (await state.get_data())["pair"] == "EURUSD"
-        assert await state.get_state() == SignalSetup.menu.state
+        assert await state.get_state() == SignalSetup.choosing_expiration.state
         provider.warm_up.assert_called_once_with(CurrencyPair("EURUSD"))
 
         for expiration in [e.name for e in Expiration.selectable()]:
@@ -79,6 +88,12 @@ async def test_old_keyboards_work_with_empty_state_and_across_submenus():
             await click("exp:" + expiration)
             assert (await state.get_data())["expiration"] == expiration
             assert await state.get_state() == SignalSetup.menu.state
+            # Manual workspace has only pair, expiry, signal and home.
+            methods = await click("menu:back")
+            menu = next(m for m in methods if isinstance(m, EditMessageText))
+            buttons = [b for row in menu.reply_markup.inline_keyboard for b in row]
+            assert len(buttons) == 4
+            assert any(b.text == "📊 Получить сигнал" for b in buttons)
 
         await state.clear()
         methods = await click("exp:AUTO")

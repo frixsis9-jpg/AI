@@ -19,7 +19,7 @@
     },
     {
       "path": "SEARCH.md",
-      "sha256": "e5c92dc49d508695dd2470e54ff43321d17ad0b9d450d6871761a6ed814dc7b3"
+      "sha256": "db55360104ad05a43b4d2123aab2c97ec03db7c8f4d5d07e1ceb8f6f1b03f666"
     },
     {
       "path": "requirements.txt",
@@ -39,7 +39,7 @@
     },
     {
       "path": "analysis/entry.py",
-      "sha256": "69757b18188a4d07c61676fe13d9b9c3ddbc5ec2fee137dbd2be224e2cccd18e"
+      "sha256": "641ffcc00d844998b7a4dc6846b0f1449b0af165c217fc46a3be610554709f91"
     },
     {
       "path": "analysis/multi_timeframe.py",
@@ -51,7 +51,7 @@
     },
     {
       "path": "bot/handlers/selection.py",
-      "sha256": "a9831996bdc0d8fb72307e8581b5a064f1d08de16e0575806634342e2e1965ca"
+      "sha256": "d763df598945e3e1fbcb0977d3dc1dec5f3943943b1ef897044560ab3b118461"
     },
     {
       "path": "bot/handlers/signal.py",
@@ -59,7 +59,7 @@
     },
     {
       "path": "bot/handlers/start.py",
-      "sha256": "046c16da15f06fe0cd9f743eecab27b46cb40d93e232fb468084078608d5bb8c"
+      "sha256": "68e29a184a2918d94c4f38330065b798a8869e8ded0e0989336b0a2b046c152e"
     },
     {
       "path": "bot/handlers/stats.py",
@@ -67,19 +67,19 @@
     },
     {
       "path": "bot/keyboards.py",
-      "sha256": "967bddb78e0f3e977d75a4318191dee21680c88b3b78b4722bd9420c07891b84"
+      "sha256": "2078d51674baf07fe3d8c5b4b1de04d13c1a707f8154a9bf3dad5eead38f3e74"
     },
     {
       "path": "bot/rendering.py",
-      "sha256": "bfe7482c5bbe8282dcbafa74e51f871ae51b67f2240b5be744fd454b833164d7"
+      "sha256": "652e99e932fb3c01d700a8ff1b6722c9fa8f858ceba09f6f5c919833d56daf3a"
     },
     {
       "path": "market_data/live_feed.py",
-      "sha256": "ca9a0042d6ace0ff4a20723f3617e9e28214dec28f0eb0bce4c63e8243748cde"
+      "sha256": "753ed71a3a0b0a0ed306eb2480b3110ecca32b4b47febf4e4821eb5b9252b870"
     },
     {
       "path": "market_data/pocket_option.py",
-      "sha256": "e7124a86c6c7220334c89b455cf62932adf78a142a1d54a0dcc5aa6e9559f9be"
+      "sha256": "95177b7e78b05cbe9a3a6b21b4b84a99c315e472c7339b2921026a87284e431f"
     },
     {
       "path": "market_data/snapshot.py",
@@ -111,7 +111,7 @@
     },
     {
       "path": "scanner/service.py",
-      "sha256": "e0ae76e572b8a58c8a433dead1e04e24d00187a7326ce82cc59811ba408f415e"
+      "sha256": "862e1dad796e7826fb12d232f6fd3d94ab7ef4f62254b8021064089c302f0952"
     }
   ]
 }

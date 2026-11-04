@@ -12,16 +12,43 @@ from domain import CurrencyPair, Expiration
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    builder.button(text="💱 Ручной сигнал", callback_data="menu:manual")
+    builder.button(text="🔎 Автопоиск пары", callback_data="mode:auto")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def workspace_keyboard(data, active=False):
+    builder = InlineKeyboardBuilder()
+    auto = data.get("pair_mode") == "auto"
+    if not auto:
+        pair = CurrencyPair(data["pair"]).label if data.get("pair") else "Выбрать пару"
+        builder.button(text="💱 " + pair, callback_data="menu:pair")
+    try:
+        label = Expiration[data.get("expiration", "")].label
+    except KeyError:
+        label = "Выбрать экспирацию"
+    builder.button(text="⌛ " + label, callback_data="menu:expiration")
+    if active:
+        builder.button(text="⏹ Остановить", callback_data="search:stop")
+    else:
+        builder.button(
+            text="▶ Начать автопоиск" if auto else "📊 Получить сигнал",
+            callback_data="search:start" if auto else "menu:signal",
+        )
+    if auto:
+        builder.button(text="⚙ Настройки автопоиска", callback_data="menu:settings")
+    builder.button(text="◀ Главное меню", callback_data="menu:home")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def settings_keyboard():
+    builder = InlineKeyboardBuilder()
     for text, action in [
-        ("💱 Выбрать пару вручную", "menu:pair"),
-        ("🔎 Автовыбор пары", "mode:auto"),
-        ("⌛ Выбрать экспирацию", "menu:expiration"),
-        ("🌐 Рынок автопоиска", "menu:market"),
-        ("☑ Список пар автопоиска", "menu:watchlist"),
-        ("▶ Начать поиск", "search:start"),
-        ("⏹ Остановить поиск", "search:stop"),
-        ("📊 Проверить сейчас", "menu:signal"),
-        ("ℹ Статус поиска", "search:status"),
+        ("🌐 Обычные / OTC", "menu:market"),
+        ("☑ Список пар", "menu:watchlist"),
+        ("◀ К автопоиску", "menu:back"),
     ]:
         builder.button(text=text, callback_data=action)
     builder.adjust(1)

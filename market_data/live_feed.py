@@ -40,8 +40,7 @@ STALE_AFTER_SECONDS = 25.0
 
 HISTORY_TIMEOUT_SECONDS = 10.0
 
-# Pocket Option serves at most ~150 bars per history request (verified
-# live), so deeper history is read page by page.
+# Keep history requests bounded; deeper history is read page by page.
 PAGE_ROWS = 150
 
 # How often the newest history page is re-read to repair tick-built bars.
@@ -57,29 +56,31 @@ async def fetch_history_page(
     platform_now: int,
     count: int | None = None,
 ) -> list[dict]:
-    """UTC historical bars from the pinned API, without live subscriptions."""
-    if page != 0:
-        return []  # no deprecated loadHistoryPeriodFast requests on a live socket
-    wanted = count or MAX_ROWS[period]
+    """One OHLC page using the verified 0.2.17 Rust request contract.
+
+    offset is a window in SECONDS, not a candle count. Despite stale Python
+    docstrings, the pinned Rust engine sends loadHistoryPeriod (not Fast).
+    compile_candles/history instead paginate raw ticks and may discard the
+    whole backfill when an outer timeout expires.
+    """
+    wanted = min(count or PAGE_ROWS, PAGE_ROWS)
+    end = platform_now - page * PAGE_ROWS * period
     async with lock:
         try:
             rows = await asyncio.wait_for(
-                client.compile_candles(asset, period, wanted * period),
+                client.get_candles_advanced(asset, period, wanted * period, end),
                 timeout=HISTORY_TIMEOUT_SECONDS,
             )
-        except Exception:
-            rows = []
-        rows = list(rows) if isinstance(rows, list) else []
-        if len(rows) < wanted:
-            try:
-                extra = await asyncio.wait_for(
-                    client.history(asset, period), timeout=HISTORY_TIMEOUT_SECONDS
-                )
-                if isinstance(extra, list):
-                    rows += extra
-            except Exception:
-                logger.debug("Chart history unavailable: %s/%ss", asset, period)
-    return [r for r in rows if isinstance(r, dict)]
+        except Exception as exc:
+            logger.warning(
+                "OHLC history unavailable for %s/%ss/page%d (%s)",
+                asset,
+                period,
+                page,
+                type(exc).__name__,
+            )
+            return []
+    return [r for r in rows or [] if isinstance(r, dict)]
 
 
 def _to_seconds(raw: object) -> float:
@@ -274,7 +275,9 @@ class AssetFeed:
         self.last_tick_monotonic: float | None = None
         self.last_used_monotonic = time.monotonic()
         self.history_loaded = False
+        self.backfill_attempted = asyncio.Event()
         self._first_tick = asyncio.Event()
+        self._repair_needed = asyncio.Event()
         self._reader: asyncio.Task | None = None
         self._maintainer: asyncio.Task | None = None
         self._stream = None
@@ -283,16 +286,14 @@ class AssetFeed:
 
     # -- lifecycle -------------------------------------------------------
     async def start(self, client, lock: asyncio.Lock | None = None) -> None:
-        """Subscribes to ticks, loads the newest history page of each period
-        (~0.7 s — enough for M1/M5 right away), then deepens the history in
-        the background. `lock` serializes history requests: the library
-        mixes up concurrent history responses (verified live — parallel
-        requests all time out), so every request goes one at a time."""
+        """Start one tick subscription, seed recent native OHLC pages, and
+        deepen history in the background using serialized requests."""
         lock = lock or asyncio.Lock()
         self._stream = await client.subscribe_symbol(self.asset)
         self._reader = asyncio.create_task(self._read(), name=f"ticks:{self.asset}")
         for period in BASE_PERIODS:
             await self._load_pages(client, lock, period, range(0, 1))
+        await self._prime_recent_ticks(client, lock)
         self.history_loaded = any(len(s) > 0 for s in self.series.values())
         logger.info(
             "Feed %s seeded: %s",
@@ -302,6 +303,39 @@ class AssetFeed:
         self._maintainer = asyncio.create_task(
             self._maintain(client, lock), name=f"history:{self.asset}"
         )
+
+    async def _prime_recent_ticks(self, client, lock):
+        """Warm the momentum window using genuine ticks, without treating a
+        historical response as a newly received live quote."""
+        if not self._tick_ts:
+            return
+        try:
+            async with lock:
+                rows = await asyncio.wait_for(
+                    client.get_ticks(self.asset, 30), timeout=5
+                )
+        except Exception:
+            return
+        if not isinstance(rows, list):
+            return
+        last_live = self._tick_ts[-1]
+        merged = {ts: px for ts, px in zip(self._tick_ts, self._tick_px)}
+        for row in rows:
+            try:
+                ts, price = float(row[0]), float(row[1])
+                if ts > 10_000_000_000:
+                    ts /= 1000
+                if (
+                    last_live - 120 <= ts < last_live
+                    and math.isfinite(price)
+                    and price > 0
+                ):
+                    merged.setdefault(ts, price)
+            except (TypeError, ValueError, IndexError):
+                continue
+        ordered = sorted(merged.items())[-MAX_TICKS:]
+        self._tick_ts = deque((t for t, p in ordered), maxlen=MAX_TICKS)
+        self._tick_px = deque((p for t, p in ordered), maxlen=MAX_TICKS)
 
     async def _read(self) -> None:
         try:
@@ -334,6 +368,8 @@ class AssetFeed:
             return  # fail closed if machine/feed clocks disagree
         for s in self.series.values():
             s.ingest(ts, price)
+            if s._bars and int(s._bars[-1][0]) in s._partial:
+                self._repair_needed.set()
         self._tick_ts.append(ts)
         self._tick_px.append(price)
         now_mono = time.monotonic()
@@ -368,8 +404,14 @@ class AssetFeed:
         return loaded
 
     async def _maintain(self, client, lock: asyncio.Lock) -> None:
-        """Repair recent OHLC periodically using compiled/chart history."""
+        """Deepen native OHLC history, then repair recent bars periodically."""
         try:
+            try:
+                for period in BASE_PERIODS:
+                    pages = (MAX_ROWS[period] + PAGE_ROWS - 1) // PAGE_ROWS
+                    await self._load_pages(client, lock, period, range(1, pages))
+            finally:
+                self.backfill_attempted.set()
             logger.info(
                 "Feed %s history coverage: %s",
                 self.asset,
@@ -377,13 +419,14 @@ class AssetFeed:
             )
             # Repair any initial hole or partial bar; do not treat gaps as
             # evidence of a universal broker delay.
-            delays = [15.0, 15.0, 30.0, 30.0, 30.0]
             while not self.closed:
-                await asyncio.sleep(
-                    delays.pop(0)
-                    if delays and self.gap_seconds(60) > 0
-                    else REFRESH_SECONDS
-                )
+                missing = any(len(series) < 120 for series in self.series.values())
+                delay = 5.0 if missing else REFRESH_SECONDS
+                try:
+                    await asyncio.wait_for(self._repair_needed.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+                self._repair_needed.clear()
                 for period in BASE_PERIODS:
                     await self._load_pages(
                         client, lock, period, range(0, 1), recent=True

@@ -9,9 +9,11 @@ from bot.keyboards import (
     main_menu_keyboard,
     market_keyboard,
     pair_keyboard,
+    settings_keyboard,
     watchlist_keyboard,
+    workspace_keyboard,
 )
-from bot.rendering import parse_selection, render_menu_text
+from bot.rendering import parse_selection, render_home_text, render_menu_text
 from bot.states import SignalSetup
 from bot.utils import safe_edit_text
 from domain import CurrencyPair, Expiration
@@ -29,7 +31,9 @@ async def stop_search(callback, search):
 async def _show_main_menu(callback, state):
     await state.set_state(SignalSetup.menu)
     await safe_edit_text(
-        callback.message, render_menu_text(await state.get_data()), main_menu_keyboard()
+        callback.message,
+        render_menu_text(await state.get_data()),
+        workspace_keyboard(await state.get_data()),
     )
 
 
@@ -62,7 +66,48 @@ async def choose_pair(
     if provider is not None:
         provider.warm_up(pair)
     await callback.answer("Ручной выбор: " + pair.label)
-    await _show_main_menu(callback, state)
+    await state.set_state(SignalSetup.choosing_expiration)
+    await safe_edit_text(
+        callback.message,
+        f"Пара: {pair.label}. Теперь выберите экспирацию:",
+        expiration_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "menu:manual")
+async def manual_mode(
+    callback: CallbackQuery,
+    state: FSMContext,
+    provider: MarketDataProvider,
+    search=None,
+):
+    await stop_search(callback, search)
+    await state.update_data(pair_mode="manual")
+    await callback.answer()
+    await state.set_state(SignalSetup.choosing_pair)
+    await safe_edit_text(
+        callback.message,
+        "Шаг 1 из 2. Выберите валютную пару:",
+        pair_keyboard(await provider.list_available_pairs()),
+    )
+
+
+@router.callback_query(F.data == "menu:home")
+async def home(callback: CallbackQuery, state: FSMContext, search=None):
+    await stop_search(callback, search)
+    await callback.answer()
+    await safe_edit_text(callback.message, render_home_text(), main_menu_keyboard())
+
+
+@router.callback_query(F.data == "menu:settings")
+async def settings(callback: CallbackQuery, state: FSMContext, search=None):
+    await stop_search(callback, search)
+    await callback.answer()
+    await safe_edit_text(
+        callback.message,
+        "Настройки автопоиска. Выберите рынок или ограничьте список пар.",
+        settings_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "mode:auto")
@@ -196,15 +241,24 @@ async def begin_search(callback, state, search, once=False):
     except ValueError as exc:
         await callback.answer(str(exc), show_alert=True)
         return
-    await callback.answer("Начинаю проверку рынка")
-    await search.start(
-        callback.message.chat.id, callback.from_user.id, options, once=once
+    await callback.answer("Проверяю выбранную пару" if once else "Запускаю автопоиск")
+    data = await state.get_data()
+    text = (
+        f"⏳ Проверяю {options.pair.label}, {options.expiration.label}. Загружаю свечи…"
+        if options.mode == "manual"
+        else f"🔎 Автопоиск запущен. Экспирация: {options.expiration.label}."
     )
-    await safe_edit_text(
-        callback.message,
-        "🔎 Поиск запущен. Если условия подходят, придёт предварительный план входа.\n"
-        "Настройки и кнопка остановки доступны ниже.",
-        main_menu_keyboard(),
+    await safe_edit_text(callback.message, text, workspace_keyboard(data, active=True))
+    await search.start(
+        callback.message.chat.id,
+        callback.from_user.id,
+        options,
+        once=once,
+        progress=(
+            callback.message.message_id,
+            workspace_keyboard(data, active=True),
+            workspace_keyboard(data),
+        ),
     )
 
 
@@ -231,7 +285,12 @@ async def search_status(callback: CallbackQuery, state: FSMContext, search=None)
     await safe_edit_text(
         callback.message,
         text + "\n\n" + render_menu_text(await state.get_data()),
-        main_menu_keyboard(),
+        workspace_keyboard(
+            await state.get_data(),
+            active=search.active(callback.message.chat.id, callback.from_user.id)
+            if search
+            else False,
+        ),
     )
 
 
