@@ -23,6 +23,7 @@ from domain import CurrencyPair, Expiration, Timeframe
 from market_data.models import Candle
 
 _TRIOS_BY_MAX_EXPIRATION_SECONDS: tuple[tuple[int, tuple[Timeframe, Timeframe, Timeframe]], ...] = (
+    (30, (Timeframe.S15, Timeframe.M1, Timeframe.M5)),
     (300, (Timeframe.M1, Timeframe.M5, Timeframe.M15)),  # 1-5 min
     (900, (Timeframe.M5, Timeframe.M15, Timeframe.M30)),  # 10-15 min
     (3600, (Timeframe.M15, Timeframe.M30, Timeframe.H1)),  # 30 min - 1 h

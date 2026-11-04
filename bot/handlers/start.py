@@ -1,4 +1,5 @@
-"""/start — resets selection and shows the main menu."""
+"""/start opens the menu, retains choices and stops any pending search."""
+
 import logging
 
 from aiogram import Router
@@ -16,13 +17,15 @@ router = Router(name="start")
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
+async def cmd_start(message: Message, state: FSMContext, search=None) -> None:
     # Logged at INFO, not shown to the user: the simplest way to find your
     # own numeric chat_id for TELEGRAM_ADMIN_CHAT_ID (see .env.example) is to
     # message this bot once and read it from these logs, rather than adding
     # a third-party bot to the mix just to look up an ID.
     logger.info("chat_id=%s used /start", message.chat.id)
+    if search is not None:
+        await search.stop(message.chat.id, message.from_user.id)
     await state.set_state(SignalSetup.menu)
-    await state.update_data(pair=None, expiration=None)
+    # Keep persisted selections; /start only opens the menu and stops old jobs.
     data = await state.get_data()
     await message.answer(render_menu_text(data), reply_markup=main_menu_keyboard())

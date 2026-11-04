@@ -1,7 +1,8 @@
 """Application configuration, loaded from environment variables / .env file."""
+
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from market_data.ssid import validate_ssid_format
@@ -97,6 +98,25 @@ class Settings(BaseSettings):
         # "not configured", not a validation error.
         if isinstance(value, str) and value.strip() == "":
             return None
+        return value
+
+    # Local search policy. Defaults are engineering gates, not fitted accuracy.
+    search_interval_seconds: float = Field(default=5.0, ge=1, le=60)
+    search_lead_seconds: float = Field(default=20.0, ge=10, le=120)
+    search_max_feeds: int = Field(default=2, ge=1, le=4)
+    search_timezone: str = "Asia/Bishkek"
+
+    @field_validator("search_timezone")
+    @classmethod
+    def valid_timezone(cls, value):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(
+                "Укажите часовой пояс IANA, например Asia/Bishkek"
+            ) from exc
         return value
 
     log_level: str = "INFO"

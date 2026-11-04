@@ -14,3 +14,6 @@ __pycache__
 docker-data
 PocketOptionSSID.exe
 tools/ssid-helper
+
+.bot-update-backups/
+update_bot.ps1

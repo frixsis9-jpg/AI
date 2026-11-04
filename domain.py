@@ -189,10 +189,8 @@ _POCKET_OPTION_BASE: dict[Timeframe, PocketOptionBase] = {
 class Expiration(int, Enum):
     """Option expiration time in seconds — independent of the analysis timeframe.
 
-    Range 5 seconds to 1 hour, matching what Pocket Option itself offers.
-    Anything under 1 minute is treated as an experimental regime by the
-    signal-generation logic (stricter confidence threshold) once that layer
-    is built — the interface still exposes all of them.
+    Manual choices range from 5 seconds to 1 hour. SEC_20 is retained for
+    compatibility with stored rows, but is not offered in the interface.
     """
 
     SEC_5 = 5
@@ -211,15 +209,11 @@ class Expiration(int, Enum):
 
     @classmethod
     def selectable(cls) -> list[Expiration]:
-        """Expirations offered in the ⌛ menu. Sub-minute ones (5-30 s) are
-        kept in the enum only so old stored signals still load; they're
-        not offered any more — at that horizon price is dominated by tick
-        noise, which no amount of analysis can read (see README)."""
-        return [e for e in cls if not e.is_short]
+        """Manual second durations plus the existing minute/hour durations."""
+        return [e for e in cls if e.value in (5, 10, 15, 30) or not e.is_short]
 
     @property
     def is_short(self) -> bool:
-        """True for sub-1-minute expirations (legacy, no longer selectable)."""
         return self.value < 60
 
     @property

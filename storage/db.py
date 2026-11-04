@@ -1,6 +1,17 @@
 """SQLite schema for the signals table."""
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS search_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    pair TEXT,
+    expiration_seconds INTEGER,
+    event TEXT NOT NULL,
+    details_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,

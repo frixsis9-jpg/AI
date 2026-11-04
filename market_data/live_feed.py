@@ -1,30 +1,17 @@
-"""Always-on, in-memory candle cache fed by one persistent tick subscription
-per asset.
+"""One UTC tick subscription per asset and repairable candle caches.
 
-Why this exists: the old path called the library's `get_candles_live()` on
-every button press, once per timeframe, one after another. Every such call
-re-subscribes and re-downloads history through three *sequential* requests
-with a 3-second timeout each — up to ~9 s per timeframe, ~27 s per signal,
-and the data could already be seconds old by the time analysis ran.
-
-Here, the first request for an asset starts ONE tick subscription and loads
-the newest history page of 1-minute and 5-minute native candles (~0.7 s);
-deeper history (5 days, for H1) follows in the background, page by page.
-From then on every tick updates both series in place, so a signal request
-just reads memory: the latest 120+ candles on every timeframe, including
-the still-forming one, with no network round-trip at all.
-
-Candle times follow the same convention as the library's own
-`get_candles_live()` (platform timestamps shifted by `PLATFORM_TIME_OFFSET`),
-and a bar counts as closed once a tick from a later bucket has arrived —
-i.e. closedness is judged by the feed's own clock, never the local PC clock,
-so a skewed Windows clock can't mislabel a bar.
+Pinned binaryoptionstoolsv2 0.2.17 supplies UTC seconds. Backfill is read
+serially, 15s/1m/5m candles are updated by ticks, larger bars require all
+native constituents. The first partial live bar is not trusted until repaired
+by historical OHLC. No source latency is hidden by clock-offset estimation.
 """
+
 from __future__ import annotations
 
 import asyncio
 import bisect
 import logging
+import math
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -33,16 +20,16 @@ from market_data.models import Candle, MarketDataError
 
 logger = logging.getLogger(__name__)
 
-# Same shift the library applies in get_candles_live() (platform time is UTC+2).
-PLATFORM_TIME_OFFSET = 7200
+# UTC contract of the pinned engine; UI timezone is applied only to messages.
+PLATFORM_TIME_OFFSET = 0  # binaryoptionstoolsv2 0.2.17 supplies UTC
 
 # Native periods kept per asset. Every analysis timeframe is built from one
 # of these: M1 from 60 s, M5/M15/M30/H1 from 300 s (see domain.PocketOptionBase).
-BASE_PERIODS = (60, 300)
+BASE_PERIODS = (15, 60, 300)
 
 # How many native candles to keep per period. 300 s x 1500 = 125 h, enough
 # for 120 closed H1 bars (1440 five-minute candles) plus margin.
-MAX_ROWS = {60: 400, 300: 1600}
+MAX_ROWS = {15: 200, 60: 400, 300: 1600}
 
 # Raw ticks kept for exact price-at-expiration lookups (storage.resolver).
 # Pocket Option sends a few ticks per second; 60k is comfortably > 1 hour.
@@ -61,31 +48,38 @@ PAGE_ROWS = 150
 REFRESH_SECONDS = 60.0
 
 
-def pages_needed(period: int) -> int:
-    return -(-MAX_ROWS[period] // PAGE_ROWS)
-
-
 async def fetch_history_page(
-    client, asset: str, period: int, page: int, lock: asyncio.Lock, platform_now: int
+    client,
+    asset: str,
+    period: int,
+    page: int,
+    lock: asyncio.Lock,
+    platform_now: int,
+    count: int | None = None,
 ) -> list[dict]:
-    """One page of `PAGE_ROWS` bars ending `page` pages back from now.
-
-    `get_candles_advanced(asset, period, offset_seconds, end_time)` takes
-    the end time in PLATFORM time (UTC+2) — passing plain UTC returns data
-    two hours old (verified live). The +600 s nudge makes page 0 include
-    the newest closed bars. Returns [] on any failure.
-    """
-    span = PAGE_ROWS * period
-    end = platform_now + 600 - page * span
+    """UTC historical bars from the pinned API, without live subscriptions."""
+    if page != 0:
+        return []  # no deprecated loadHistoryPeriodFast requests on a live socket
+    wanted = count or MAX_ROWS[period]
     async with lock:
         try:
             rows = await asyncio.wait_for(
-                client.get_candles_advanced(asset, period, span, end), timeout=HISTORY_TIMEOUT_SECONDS
+                client.compile_candles(asset, period, wanted * period),
+                timeout=HISTORY_TIMEOUT_SECONDS,
             )
-        except Exception as exc:  # noqa: BLE001 - unofficial client, best effort
-            logger.debug("history page %s/%ss/%d failed: %s", asset, period, page, exc)
-            return []
-    return [r for r in rows or [] if isinstance(r, dict)]
+        except Exception:
+            rows = []
+        rows = list(rows) if isinstance(rows, list) else []
+        if len(rows) < wanted:
+            try:
+                extra = await asyncio.wait_for(
+                    client.history(asset, period), timeout=HISTORY_TIMEOUT_SECONDS
+                )
+                if isinstance(extra, list):
+                    rows += extra
+            except Exception:
+                logger.debug("Chart history unavailable: %s/%ss", asset, period)
+    return [r for r in rows if isinstance(r, dict)]
 
 
 def _to_seconds(raw: object) -> float:
@@ -122,6 +116,7 @@ class CandleSeries:
         self.period = period
         self._bars: deque[list[float]] = deque(maxlen=max_rows)  # [t, o, h, l, c]
         self._forming: list[float] | None = None
+        self._partial: set[int] = set()
 
     def seed(self, history: list[dict]) -> None:
         """Merges server candles in. For a CLOSED bucket the server's bar
@@ -134,6 +129,8 @@ class CandleSeries:
                 continue
             try:
                 t = int(_to_seconds(item.get("time", item.get("timestamp"))))
+                if t >= int(time.time()) // self.period * self.period:
+                    continue  # historical source may include the forming bucket
                 bar = [
                     float(t - t % self.period),
                     float(item["open"]),
@@ -144,8 +141,13 @@ class CandleSeries:
             except (KeyError, TypeError, ValueError):
                 continue
             merged[int(bar[0])] = bar
+            self._partial.discard(int(bar[0]))
         forming_start = self._forming[0] if self._forming else None
-        ordered = [merged[k] for k in sorted(merged) if forming_start is None or k < forming_start]
+        ordered = [
+            merged[k]
+            for k in sorted(merged)
+            if forming_start is None or k < forming_start
+        ]
         self._bars = deque(ordered[-self._bars.maxlen :], maxlen=self._bars.maxlen)  # type: ignore[index]
 
     def ingest(self, ts: float, price: float) -> None:
@@ -155,6 +157,7 @@ class CandleSeries:
             if self._bars and start <= self._bars[-1][0]:
                 return  # late tick for a bar already sealed from history
             self._forming = [start, price, price, price, price]
+            self._partial.add(int(start))  # subscription may start mid-candle
             return
         if start == forming[0]:
             if price > forming[2]:
@@ -170,10 +173,11 @@ class CandleSeries:
     def gap_seconds(self) -> float:
         if not self._bars or self._forming is None:
             return 0.0
-        return max(0.0, self._forming[0] - self._bars[-1][0] - self.period)
+        times = [b[0] for b in self._bars] + [self._forming[0]]
+        return sum(max(0.0, b - a - self.period) for a, b in zip(times, times[1:]))
 
     def candles(self) -> list[Candle]:
-        out = [_candle(bar, True) for bar in self._bars]
+        out = [_candle(bar, int(bar[0]) not in self._partial) for bar in self._bars]
         if self._forming is not None:
             out.append(_candle(self._forming, False))
         return out
@@ -193,7 +197,9 @@ def _candle(bar: list[float], is_closed: bool) -> Candle:
     )
 
 
-def aggregate_by_time(base: list[Candle], period_seconds: int, now_ts: float | None) -> list[Candle]:
+def aggregate_by_time(
+    base: list[Candle], period_seconds: int, now_ts: float | None
+) -> list[Candle]:
     """Groups native candles into `period_seconds` bars aligned to clock
     boundaries (a 15-minute bar is always :00-:15, :15-:30, ...), not
     "every N candles from wherever the list happens to start" — the old
@@ -204,33 +210,56 @@ def aggregate_by_time(base: list[Candle], period_seconds: int, now_ts: float | N
     A bar is closed once `now_ts` (the feed's latest tick time) has reached
     its end; a bar with gaps inside (market pause) still closes by time.
     """
-    grouped: list[Candle] = []
-    current_key: int | None = None
-    o = h = l = c = 0.0
-    for candle in base:
-        ts = int(candle.time.timestamp())
-        key = ts - ts % period_seconds
-        if key != current_key:
-            if current_key is not None:
-                grouped.append(_bar(current_key, o, h, l, c, period_seconds, now_ts))
-            current_key, o, h, l, c = key, candle.open, candle.high, candle.low, candle.close
-        else:
-            h = max(h, candle.high)
-            l = min(l, candle.low)
-            c = candle.close
-    if current_key is not None:
-        grouped.append(_bar(current_key, o, h, l, c, period_seconds, now_ts))
-        if base and not base[-1].is_closed and grouped[-1].is_closed:
-            # the underlying native bar is still forming, so this group is too
-            grouped[-1] = Candle(grouped[-1].time, o, h, l, c, is_closed=False)
-    return grouped
+    if not base:
+        return []
+    native = min(
+        (
+            int((b.time - a.time).total_seconds())
+            for a, b in zip(base, base[1:])
+            if b.time > a.time
+        ),
+        default=period_seconds,
+    )
+    # Use native periods explicitly for larger TFs, even if every other bar
+    # is missing: a regular gap must not be mistaken for a wider native bar.
+    native = 300 if period_seconds >= 900 else min(native, period_seconds)
+    groups: dict[int, list[Candle]] = {}
+    for c in base:
+        key = int(c.time.timestamp()) // period_seconds * period_seconds
+        groups.setdefault(key, []).append(c)
+    out = []
+    for key, rows in sorted(groups.items()):
+        rows.sort(key=lambda c: c.time)
+        expected = list(range(key, key + period_seconds, native))
+        complete = [int(c.time.timestamp()) for c in rows] == expected and all(
+            c.is_closed for c in rows
+        )
+        out.append(
+            Candle(
+                datetime.fromtimestamp(key, tz=timezone.utc),
+                rows[0].open,
+                max(c.high for c in rows),
+                min(c.low for c in rows),
+                rows[-1].close,
+                is_closed=complete
+                and now_ts is not None
+                and key + period_seconds <= now_ts,
+            )
+        )
+    return out
 
 
-def _bar(key: int, o: float, h: float, l: float, c: float, period: int, now_ts: float | None) -> Candle:
+def _bar(
+    key: int, o: float, h: float, l: float, c: float, period: int, now_ts: float | None
+) -> Candle:
     closed = now_ts is None or key + period <= now_ts
     return Candle(
         time=datetime.fromtimestamp(key, tz=timezone.utc),
-        open=o, high=h, low=l, close=c, is_closed=closed,
+        open=o,
+        high=h,
+        low=l,
+        close=c,
+        is_closed=closed,
     )
 
 
@@ -243,9 +272,6 @@ class AssetFeed:
         self._tick_ts: deque[float] = deque(maxlen=MAX_TICKS)
         self._tick_px: deque[float] = deque(maxlen=MAX_TICKS)
         self.last_tick_monotonic: float | None = None
-        # feed-clock minus local-clock, smoothed; lets callers translate a
-        # local datetime (e.g. a signal's expires_at) into feed time.
-        self.clock_offset: float | None = None
         self.last_used_monotonic = time.monotonic()
         self.history_loaded = False
         self._first_tick = asyncio.Event()
@@ -269,10 +295,13 @@ class AssetFeed:
             await self._load_pages(client, lock, period, range(0, 1))
         self.history_loaded = any(len(s) > 0 for s in self.series.values())
         logger.info(
-            "Feed %s seeded: %s", self.asset,
+            "Feed %s seeded: %s",
+            self.asset,
             ", ".join(f"{p}s={len(self.series[p])}" for p in BASE_PERIODS),
         )
-        self._maintainer = asyncio.create_task(self._maintain(client, lock), name=f"history:{self.asset}")
+        self._maintainer = asyncio.create_task(
+            self._maintain(client, lock), name=f"history:{self.asset}"
+        )
 
     async def _read(self) -> None:
         try:
@@ -283,32 +312,55 @@ class AssetFeed:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # unofficial client: no fixed exception hierarchy
-            self.error = str(exc)
-            logger.warning("Tick stream for %s ended: %s", self.asset, exc)
+            self.error = f"Поток котировок завершился ({type(exc).__name__})"
+            logger.warning(
+                "Tick stream for %s ended (%s)", self.asset, type(exc).__name__
+            )
         finally:
             self.closed = True
 
     def on_tick(self, ts: float, price: float) -> None:
+        if not math.isfinite(ts) or not math.isfinite(price) or price <= 0:
+            return
+        if self._tick_ts and (
+            ts < self._tick_ts[-1]
+            or (ts == self._tick_ts[-1] and price == self._tick_px[-1])
+        ):
+            return  # preserve sorted tick history and the newest quote
+        if ts > time.time() + 0.5:
+            self.error = (
+                "Время котировок в будущем: включите синхронизацию часов Windows"
+            )
+            return  # fail closed if machine/feed clocks disagree
         for s in self.series.values():
             s.ingest(ts, price)
         self._tick_ts.append(ts)
         self._tick_px.append(price)
         now_mono = time.monotonic()
         self.last_tick_monotonic = now_mono
-        offset = ts - time.time()
-        if self.clock_offset is None:
-            self.clock_offset = offset
-        else:
-            # latency only ever makes a tick look *older*, so track the
-            # upper envelope with slow decay rather than a plain mean
-            self.clock_offset = max(offset, self.clock_offset - 0.05)
         self._first_tick.set()
 
-    async def _load_pages(self, client, lock: asyncio.Lock, period: int, pages: range) -> int:
+    async def _load_pages(
+        self,
+        client,
+        lock: asyncio.Lock,
+        period: int,
+        pages: range,
+        *,
+        recent: bool = False,
+    ) -> int:
         loaded = 0
         platform_now = int(time.time()) + PLATFORM_TIME_OFFSET
         for page in pages:
-            rows = await fetch_history_page(client, self.asset, period, page, lock, platform_now)
+            rows = await fetch_history_page(
+                client,
+                self.asset,
+                period,
+                page,
+                lock,
+                platform_now,
+                count=PAGE_ROWS if recent else MAX_ROWS[period],
+            )
             if not rows:
                 break  # no older data (or a failure) — deeper pages won't help
             self.series[period].seed(rows)
@@ -316,29 +368,31 @@ class AssetFeed:
         return loaded
 
     async def _maintain(self, client, lock: asyncio.Lock) -> None:
-        """Background: first deepen the history to the full MAX_ROWS, then
-        every REFRESH_SECONDS re-read the newest page so any bar built from
-        an incomplete set of ticks gets replaced by the server's bar."""
+        """Repair recent OHLC periodically using compiled/chart history."""
         try:
-            for period in BASE_PERIODS:
-                await self._load_pages(client, lock, period, range(1, pages_needed(period)))
             logger.info(
-                "Feed %s history complete: %s", self.asset,
+                "Feed %s history coverage: %s",
+                self.asset,
                 ", ".join(f"{p}s={len(self.series[p])}" for p in BASE_PERIODS),
             )
-            # The server publishes its newest bars ~2-4 minutes late
-            # (verified live), so right after start there's a hole between
-            # its last bar and our first tick. Re-read the newest page soon
-            # and often until that hole is closed, then once a minute.
+            # Repair any initial hole or partial bar; do not treat gaps as
+            # evidence of a universal broker delay.
             delays = [15.0, 15.0, 30.0, 30.0, 30.0]
             while not self.closed:
-                await asyncio.sleep(delays.pop(0) if delays and self.gap_seconds(60) > 0 else REFRESH_SECONDS)
+                await asyncio.sleep(
+                    delays.pop(0)
+                    if delays and self.gap_seconds(60) > 0
+                    else REFRESH_SECONDS
+                )
                 for period in BASE_PERIODS:
-                    await self._load_pages(client, lock, period, range(0, 1))
+                    await self._load_pages(
+                        client, lock, period, range(0, 1), recent=True
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - maintenance must never kill the feed
             logger.exception("History maintenance for %s failed", self.asset)
+
     async def wait_first_tick(self, timeout: float) -> bool:
         try:
             await asyncio.wait_for(self._first_tick.wait(), timeout)
@@ -356,14 +410,22 @@ class AssetFeed:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        self._stream = None  # dropping the subscription unsubscribes it
+        stream, self._stream = self._stream, None
+        if stream is not None and hasattr(stream, "unsubscribe"):
+            try:
+                await asyncio.wait_for(stream.unsubscribe(), timeout=5)
+            except Exception:
+                logger.warning("Could not unsubscribe %s", self.asset)
 
     # -- reads -----------------------------------------------------------
     @property
     def tick_age(self) -> float | None:
         if self.last_tick_monotonic is None:
             return None
-        return time.monotonic() - self.last_tick_monotonic
+        return max(
+            time.monotonic() - self.last_tick_monotonic,
+            time.time() - (self.feed_now or 0),
+        )
 
     @property
     def is_stale(self) -> bool:
@@ -390,16 +452,23 @@ class AssetFeed:
         return aggregate_by_time(base, period_seconds, self.feed_now)
 
     def local_to_feed_time(self, when: datetime) -> float:
-        offset = self.clock_offset or 0.0
-        return when.timestamp() + offset
+        return when.timestamp()  # engine and database both use UTC
 
-    def price_at(self, feed_ts: float) -> float | None:
+    def price_at(self, feed_ts: float, max_age: float = 2.0) -> float | None:
         """Last tick price at or before `feed_ts`, or None if the tick
         history doesn't reach back that far / hasn't reached it yet."""
-        if not self._tick_ts or feed_ts < self._tick_ts[0] or feed_ts > self._tick_ts[-1]:
+        if (
+            not self._tick_ts
+            or feed_ts < self._tick_ts[0]
+            or feed_ts > self._tick_ts[-1]
+        ):
             return None
         idx = bisect.bisect_right(self._tick_ts, feed_ts) - 1
-        if idx < 0:
+        if idx < 0 or feed_ts - self._tick_ts[idx] > max_age:
+            return None
+        if self._tick_ts[idx] < feed_ts and (
+            idx + 1 >= len(self._tick_ts) or self._tick_ts[idx + 1] - feed_ts > max_age
+        ):
             return None
         return self._tick_px[idx]
 

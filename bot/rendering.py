@@ -1,55 +1,50 @@
-"""Turns FSM-stored selection data into domain values and user-facing text.
-
-FSM storage only holds JSON-serialisable data. `expiration` is kept as its
-enum `.name` string. `pair` is kept as its raw Pocket Option symbol (e.g.
-"EURUSD", "EURUSD_otc") — CurrencyPair is a plain `str` subclass (see
-domain.py), so that value round-trips through `CurrencyPair(...)` directly,
-with no lookup table needed the way the old fixed-enum `.name` did.
-
-There is no timeframe selection here — the bot picks a trio of timeframes
-automatically from the chosen expiration (see
-analysis.multi_timeframe.timeframe_trio_for and bot/handlers/signal.py), so
-it's not part of the user's selection at all.
-"""
-from __future__ import annotations
+"""Human-readable persistent menu choices. Search tasks are never restored."""
 
 from domain import CurrencyPair, Expiration
 
-Selection = tuple[CurrencyPair | None, Expiration | None]
-
-# Stored in FSM instead of an Expiration name when the user lets the analyst
-# desk pick the expiration (see analyst/ and bot/handlers/analyst_flow.py).
-AUTO = "AUTO"
+AUTO = "AUTO"  # old callback compatibility; new search requires a fixed expiry
 
 
-def is_auto(data: dict) -> bool:
+def is_auto(data):
     return data.get("expiration") == AUTO
 
 
-def parse_selection(data: dict) -> Selection:
-    pair_symbol = data.get("pair")
-    expiration_name = data.get("expiration")
-    pair = CurrencyPair(pair_symbol) if pair_symbol else None
-    expiration = Expiration[expiration_name] if expiration_name and expiration_name != AUTO else None
-    if expiration is not None and expiration.is_short:
-        expiration = None  # chosen before sub-minute expirations were removed
+def parse_selection(data):
+    pair = CurrencyPair(data["pair"]) if data.get("pair") else None
+    try:
+        expiration = Expiration[data.get("expiration", "")]
+    except KeyError:
+        expiration = None
+    if expiration not in Expiration.selectable():
+        expiration = None
     return pair, expiration
 
 
-def render_menu_text(data: dict) -> str:
+def render_menu_text(data):
     pair, expiration = parse_selection(data)
-    pair_text = pair.label if pair else "не выбрана"
-    expiration_text = (
-        "🧠 авто — аналитик подберёт" if is_auto(data) else expiration.label if expiration else "не выбрана"
+    mode = (
+        "🔎 Автовыбор пары"
+        if data.get("pair_mode") == "auto"
+        else "💱 Ручной выбор пары"
     )
+    market = {"both": "Обычные + OTC", "regular": "Обычные", "otc": "OTC"}.get(
+        data.get("market", "both"), "Обычные + OTC"
+    )
+    pair_text = (
+        "автопоиск"
+        if data.get("pair_mode") == "auto"
+        else pair.label
+        if pair
+        else "не выбрана"
+    )
+    watch = data.get("watchlist", [])
     return (
-        "Настройка сигнала для Pocket Option:\n\n"
-        f"💱 Валюта: {pair_text}\n"
-        f"⌛ Экспирация: {expiration_text}\n\n"
-        "Бот анализирует 3 таймфрейма по 120 свечей в реальном времени "
-        "(ликвидность, ретесты уровней, структура, имбалансы, индикаторы) и "
-        "всегда выдаёт направление ВВЕРХ/ВНИЗ с вероятностью успеха в % и "
-        "причинами за и против.\n"
-        "Выберите, что изменить, либо запросите сигнал, когда всё задано.\n"
-        "Команда /stats — статистика по сохранённым сигналам."
+        "Настройка поиска входа:\n\n"
+        f"Режим: {mode}\nПара: {pair_text}\n"
+        f"Экспирация: {expiration.label if expiration else 'выберите время'}\n"
+        f"Рынок автопоиска: {market}\nСписок автопоиска: {str(len(watch)) + ' пар' if watch else 'все доступные основные пары'}\n\n"
+        "Выберите экспирацию и пару либо автовыбор. Нажмите «Начать поиск».\n"
+        "При слабых условиях бот ждёт. План входа предварительный до подтверждения.\n"
+        "5–30 секунд — экспериментальный режим; время ручного входа критично.\n"
+        "После перезапуска настройки сохраняются, поиск запускается кнопкой.\n/stats — модельные результаты, а не ваши реальные сделки."
     )

@@ -13,7 +13,7 @@ pydantic-settings>=2.4,<3
 # Unofficial Pocket Option WebSocket client (no official API exists).
 # Prebuilt manylinux/abi3 wheels exist for Python 3.10-3.12 — no Rust
 # toolchain needed to install.
-binaryoptionstoolsv2>=0.2.11,<1
+binaryoptionstoolsv2==0.2.17
 
 # Claude second-opinion review (ai/) and async SQLite persistence (storage/).
 anthropic>=0.34,<2

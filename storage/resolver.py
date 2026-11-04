@@ -5,6 +5,7 @@ Pocket Option price via the same `MarketDataProvider` the rest of the bot
 uses, and if that fetch fails the outcome is honestly recorded as UNKNOWN
 rather than invented.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -41,6 +42,9 @@ async def resolve_pending_signals(
 
     for signal in pending:
         late_by = (now - signal.expires_at).total_seconds()
+        strict = bool(
+            signal.model_version and signal.model_version.startswith("entry-v1")
+        )
 
         # Preferred: the exact tick price at the expiration instant, from
         # the live feed's tick history (market_data/live_feed.py) — this is
@@ -50,9 +54,18 @@ async def resolve_pending_signals(
             passed = provider.feed_has_passed(signal.pair, signal.expires_at)
             if passed is False and late_by < _TICK_WAIT_SECONDS:
                 continue  # no tick after expiry yet — try again next round
-            price = await price_at(signal.pair, signal.expires_at)
+            if strict:
+                from analysis.entry import age_limit
+
+                price = await price_at(
+                    signal.pair, signal.expires_at, max_age=age_limit(signal.expiration)
+                )
+            else:
+                price = await price_at(signal.pair, signal.expires_at)
             if price is not None:
-                outcome = _determine_outcome(signal.final_direction, signal.entry_price, price)
+                outcome = _determine_outcome(
+                    signal.final_direction, signal.entry_price, price
+                )
                 await repo.mark_resolved(signal.id, outcome, price, resolved_at)
                 resolved += 1
                 continue
@@ -60,7 +73,7 @@ async def resolve_pending_signals(
         # Fallback: current price, but only if we're still close enough to
         # the expiration for it to mean the same thing; otherwise record an
         # honest UNKNOWN rather than a result measured at the wrong time.
-        if late_by > _max_fallback_lateness(signal.expiration.value):
+        if strict or late_by > _max_fallback_lateness(signal.expiration.value):
             await repo.mark_resolved(signal.id, "UNKNOWN", None, resolved_at)
             resolved += 1
             continue
@@ -70,7 +83,9 @@ async def resolve_pending_signals(
         if price is None:
             await repo.mark_resolved(signal.id, "UNKNOWN", None, resolved_at)
         else:
-            outcome = _determine_outcome(signal.final_direction, signal.entry_price, price)
+            outcome = _determine_outcome(
+                signal.final_direction, signal.entry_price, price
+            )
             await repo.mark_resolved(signal.id, outcome, price, resolved_at)
         resolved += 1
 
@@ -87,7 +102,9 @@ def _max_fallback_lateness(expiration_seconds: int) -> float:
     return max(5.0, min(30.0, expiration_seconds * 0.05))
 
 
-async def _fetch_latest_price(provider: MarketDataProvider, pair: CurrencyPair) -> float | None:
+async def _fetch_latest_price(
+    provider: MarketDataProvider, pair: CurrencyPair
+) -> float | None:
     try:
         candles = await provider.get_candles(pair, Timeframe.M1, output_size=1)
     except MarketDataError:

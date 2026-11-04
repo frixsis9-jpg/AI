@@ -4,6 +4,7 @@ Uses `aiosqlite` (not the stdlib `sqlite3` directly) because aiogram handlers
 are async and a blocking sqlite3 call would stall the whole bot's event loop
 for every user while it runs.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,7 +38,9 @@ class SignalRepository:
         existing = {row[1] for row in await cursor.fetchall()}
         for column, sql_type in MIGRATION_COLUMNS.items():
             if column not in existing:
-                await conn.execute(f"ALTER TABLE signals ADD COLUMN {column} {sql_type}")
+                await conn.execute(
+                    f"ALTER TABLE signals ADD COLUMN {column} {sql_type}"
+                )
         await conn.commit()
         self._conn = conn
 
@@ -93,14 +96,16 @@ class SignalRepository:
         assert cursor.lastrowid is not None
         return cursor.lastrowid
 
-    async def get_pending_signals(self, now: datetime | None = None) -> list[PendingSignal]:
+    async def get_pending_signals(
+        self, now: datetime | None = None
+    ) -> list[PendingSignal]:
         """CALL/PUT signals whose expiration has passed but have no outcome yet."""
         conn = self._conn_or_raise()
         now = now or datetime.now(timezone.utc)
         cursor = await conn.execute(
             """
             SELECT id, pair, timeframe, expiration_seconds, final_direction,
-                   entry_price, expires_at
+                   entry_price, expires_at, model_version
             FROM signals
             WHERE outcome IS NULL AND expires_at <= ?
             ORDER BY expires_at
@@ -135,14 +140,14 @@ class SignalRepository:
         cursor = await conn.execute(
             """
             SELECT
-                pair, timeframe, expiration_seconds,
+                pair, timeframe, expiration_seconds, model_version,
                 SUM(CASE WHEN outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
                 SUM(CASE WHEN outcome = 'LOSS' THEN 1 ELSE 0 END) AS losses,
                 SUM(CASE WHEN outcome = 'UNKNOWN' THEN 1 ELSE 0 END) AS unknown,
                 SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) AS pending
             FROM signals
             WHERE final_direction != 'WAIT'
-            GROUP BY pair, timeframe, expiration_seconds
+            GROUP BY pair, timeframe, expiration_seconds, model_version
             ORDER BY pair, timeframe, expiration_seconds
             """
         )
@@ -156,12 +161,14 @@ class SignalRepository:
                 losses=row["losses"],
                 unknown=row["unknown"],
                 pending=row["pending"],
+                model_version=row["model_version"],
             )
             for row in rows
         ]
 
-
-    async def resolved_outcomes(self, model_version: str) -> list[tuple[float, bool, int]]:
+    async def resolved_outcomes(
+        self, model_version: str
+    ) -> list[tuple[float, bool, int]]:
         """(model probability %, won?, expiration seconds) for every
         WIN/LOSS signal produced by `model_version` — the raw material for
         calibrating the shown probability against reality."""
@@ -174,9 +181,31 @@ class SignalRepository:
             (model_version,),
         )
         return [
-            (float(row["confidence"]), row["outcome"] == "WIN", int(row["expiration_seconds"]))
+            (
+                float(row["confidence"]),
+                row["outcome"] == "WIN",
+                int(row["expiration_seconds"]),
+            )
             for row in await cursor.fetchall()
         ]
+
+    async def log_search(
+        self, chat_id, user_id, event, *, pair=None, expiration=None, **details
+    ):
+        conn = self._conn_or_raise()
+        await conn.execute(
+            "INSERT INTO search_events(chat_id,user_id,created_at,pair,expiration_seconds,event,details_json) VALUES (?,?,?,?,?,?,?)",
+            (
+                chat_id,
+                user_id,
+                datetime.now(timezone.utc).isoformat(),
+                str(pair) if pair else None,
+                int(expiration) if expiration else None,
+                event,
+                json.dumps(details, ensure_ascii=False),
+            ),
+        )
+        await conn.commit()
 
 
 def _row_to_pending(row: aiosqlite.Row) -> PendingSignal:
@@ -189,4 +218,5 @@ def _row_to_pending(row: aiosqlite.Row) -> PendingSignal:
         final_direction=direction,
         entry_price=row["entry_price"],
         expires_at=datetime.fromisoformat(row["expires_at"]),
+        model_version=row["model_version"],
     )

@@ -6,10 +6,11 @@ via the `binaryoptionstoolsv2` package, authenticated with a session id
 one. This is NOT an official Pocket Option API; there isn't one.
 
 Candles come from `market_data.live_feed`: one persistent tick subscription
-per asset keeps 1-minute and 5-minute series current in memory, so a signal
+per asset keeps 15-second, 1-minute and 5-minute series current in memory, so a signal
 request reads ready data instantly instead of re-downloading history per
 timeframe (see that module's docstring for the numbers behind this change).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +23,7 @@ from domain import REGULAR_PAIRS, CurrencyPair, Timeframe
 from market_data.live_feed import AssetFeed, FeedUnavailableError
 from market_data.models import Candle, MarketDataError
 from market_data.provider import MarketDataProvider
+from market_data.snapshot import MarketSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +37,6 @@ _FIRST_TICK_TIMEOUT_SECONDS = 12.0
 # Feeds not used for this long are closed (resolver lookups count as use,
 # and the longest expiration is 1 h, so pending signals keep theirs alive).
 _FEED_IDLE_SECONDS = 75 * 60
-
-# Hard cap on simultaneously open subscriptions.
-_MAX_FEEDS = 12
 
 _PROBE_PREFERENCE = ("EURUSD_otc", "EURUSD", "GBPUSD_otc", "AUDCAD_otc")
 
@@ -93,7 +92,13 @@ class SupportsPocketOptionClient(Protocol):
 
     async def subscribe_symbol(self, asset: str): ...
 
-    async def get_candles_advanced(self, asset: str, period: int, offset: int, time: int) -> list[dict]: ...
+    async def compile_candles(
+        self, asset: str, period: int, lookback: int
+    ) -> list[dict]: ...
+
+    async def candles(
+        self, asset: str, period: int, count: int, end_time: int
+    ) -> list[dict]: ...
 
     async def history(self, asset: str, period: int) -> list[dict]: ...
 
@@ -107,9 +112,17 @@ class SupportsPocketOptionClient(Protocol):
 class PocketOptionProvider(MarketDataProvider):
     """Serves real Pocket Option candles from always-on live feeds."""
 
-    def __init__(self, ssid: str, client: SupportsPocketOptionClient | None = None) -> None:
+    def __init__(
+        self,
+        ssid: str,
+        client: SupportsPocketOptionClient | None = None,
+        max_feeds: int = 2,
+    ) -> None:
         if not ssid and client is None:
             raise ValueError("Pocket Option SSID must not be empty")
+        self.max_feeds = max(1, max_feeds)
+        self._pinned_until: dict[object, tuple[str, float]] = {}
+        self._creation_lock = asyncio.Lock()
         self._ssid = ssid
         self._client = client
         self._owns_client = client is None
@@ -141,7 +154,7 @@ class PocketOptionProvider(MarketDataProvider):
             return feed
 
         lock = self._feed_locks.setdefault(asset, asyncio.Lock())
-        async with lock:
+        async with lock, self._creation_lock:
             feed = self._feeds.get(asset)
             if feed is not None and not feed.is_stale:
                 feed.last_used_monotonic = time.monotonic()
@@ -149,13 +162,17 @@ class PocketOptionProvider(MarketDataProvider):
 
             client = await self._get_client()
             if feed is not None:
-                logger.info("Restarting stale feed for %s (tick age %s)", asset, feed.tick_age)
+                logger.info(
+                    "Restarting stale feed for %s (tick age %s)", asset, feed.tick_age
+                )
                 await feed.stop(client)
                 self._feeds.pop(asset, None)
 
             active_symbols = await self._list_active_pocket_option_symbols(client)
             if active_symbols is not None and asset not in active_symbols:
-                raise MarketDataError(self._inactive_asset_message(pair, active_symbols))
+                raise MarketDataError(
+                    self._inactive_asset_message(pair, active_symbols)
+                )
 
             await self._reap_idle_feeds(client)
             feed = AssetFeed(asset)
@@ -163,35 +180,100 @@ class PocketOptionProvider(MarketDataProvider):
                 self._history_lock = asyncio.Lock()
             try:
                 await feed.start(client, self._history_lock)
+            except asyncio.CancelledError:
+                await feed.stop(client)
+                raise
             except Exception as exc:  # unofficial client: no fixed exception hierarchy
                 await feed.stop(client)
-                raise MarketDataError(self._connection_error_message(pair, exc)) from exc
+                raise MarketDataError(
+                    self._connection_error_message(pair, exc)
+                ) from exc
 
-            if not await feed.wait_first_tick(_FIRST_TICK_TIMEOUT_SECONDS):
+            try:
+                received = await feed.wait_first_tick(_FIRST_TICK_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
                 await feed.stop(client)
-                raise FeedUnavailableError(self._no_quotes_message(pair))
+                raise
+            if not received:
+                await feed.stop(client)
+                raise FeedUnavailableError(feed.error or self._no_quotes_message(pair))
 
             self._feeds[asset] = feed
             self._ever_succeeded = True
             return feed
 
+    def pin(self, pair: CurrencyPair, until: float):
+        token = object()
+        self._pinned_until[token] = (str(pair), until)
+        return token
+
+    def release(self, token):
+        self._pinned_until.pop(token, None)
+
+    def _is_pinned(self, asset):
+        self._pinned_until = {
+            k: v for k, v in self._pinned_until.items() if v[1] > time.time()
+        }
+        return any(symbol == asset for symbol, _ in self._pinned_until.values())
+
     async def _reap_idle_feeds(self, client) -> None:
         now = time.monotonic()
+        free = [a for a in self._feeds if not self._is_pinned(a)]
         idle = [
-            a for a, f in self._feeds.items()
-            if f.closed or now - f.last_used_monotonic > _FEED_IDLE_SECONDS
+            a
+            for a in free
+            if self._feeds[a].closed
+            or now - self._feeds[a].last_used_monotonic > _FEED_IDLE_SECONDS
         ]
-        overflow = len(self._feeds) - len(idle) - (_MAX_FEEDS - 1)
-        if overflow > 0:
-            by_age = sorted(
-                (a for a in self._feeds if a not in idle),
-                key=lambda a: self._feeds[a].last_used_monotonic,
+        needed = max(0, len(self._feeds) - len(idle) - self.max_feeds + 1)
+        idle += sorted(
+            (a for a in free if a not in idle),
+            key=lambda a: self._feeds[a].last_used_monotonic,
+        )[:needed]
+        if len(self._feeds) - len(idle) >= self.max_feeds:
+            raise MarketDataError(
+                "Потоки заняты подтверждёнными сигналами. Ожидаю завершения экспирации"
             )
-            idle += by_age[:overflow]
         for asset in idle:
-            feed = self._feeds.pop(asset, None)
-            if feed is not None:
-                await feed.stop(client)
+            feed = self._feeds.pop(asset)
+            await feed.stop(client)
+
+    async def get_snapshot(
+        self, pair: CurrencyPair, timeframes, output_size: int = 121
+    ) -> MarketSnapshot:
+        feed = await self._ensure_feed(pair)
+        if feed.last_price is None or feed.feed_now is None:
+            raise FeedUnavailableError(self._no_quotes_message(pair))
+        # No awaits between candle/tick reads: one consistent event-loop snapshot.
+        now = time.time()
+        return MarketSnapshot(
+            pair,
+            now,
+            feed.feed_now,
+            time.monotonic() - (feed.last_tick_monotonic or 0),
+            feed.last_price,
+            {
+                tf: feed.candles(tf.seconds, tf.pocket_option_base.period_seconds)[
+                    -output_size:
+                ]
+                for tf in timeframes
+            },
+            tuple(
+                (ts, px)
+                for ts, px in zip(feed._tick_ts, feed._tick_px)
+                if ts >= now - 120
+            ),
+        )
+
+    async def list_active_pairs(self) -> list[CurrencyPair]:
+        client = await self._get_client()
+        try:
+            await asyncio.wait_for(client.wait_for_assets(), timeout=15)
+            return _pairs_from_active_assets(
+                await asyncio.wait_for(client.active_assets(), timeout=10)
+            )
+        except Exception as exc:
+            raise MarketDataError("Не удалось проверить список активных валют") from exc
 
     def warm_up(self, pair: CurrencyPair) -> None:
         """Starts the pair's feed in the background (called the moment a
@@ -226,16 +308,9 @@ class PocketOptionProvider(MarketDataProvider):
     ) -> tuple[dict[Timeframe, list[Candle]], float, float]:
         """Every requested timeframe read from ONE consistent moment of the
         feed, plus the latest tick price and its age in seconds."""
-        feed = await self._ensure_feed(pair)
-        result: dict[Timeframe, list[Candle]] = {}
-        for tf in timeframes:
-            candles = feed.candles(tf.seconds, tf.pocket_option_base.period_seconds)
-            if candles:
-                result[tf] = candles[-output_size:]
-        price = feed.last_price
-        if price is None:
-            raise FeedUnavailableError(self._no_quotes_message(pair))
-        return result, price, feed.tick_age or 0.0
+        snapshot = await self.get_snapshot(pair, timeframes, output_size)
+        snapshot.validate(timeframes, max_age=2.0)
+        return snapshot.candles, snapshot.price, snapshot.age
 
     def history_gap_seconds(self, pair: CurrencyPair) -> float:
         """How many seconds of 1-minute bars are still missing between the
@@ -244,7 +319,9 @@ class PocketOptionProvider(MarketDataProvider):
         feed = self._feeds.get(pair.pocket_option_symbol)
         return feed.gap_seconds(60) if feed is not None else 0.0
 
-    async def price_at(self, pair: CurrencyPair, when: datetime) -> float | None:
+    async def price_at(
+        self, pair: CurrencyPair, when: datetime, max_age: float = 2.0
+    ) -> float | None:
         """Price at an exact moment (tick-accurate) if the live feed still
         covers it, else None. Used by storage.resolver to settle signals at
         the real expiration instant instead of "whenever the loop ran"."""
@@ -252,7 +329,7 @@ class PocketOptionProvider(MarketDataProvider):
         if feed is None or feed.closed:
             return None
         feed.last_used_monotonic = time.monotonic()
-        return feed.price_at(feed.local_to_feed_time(when))
+        return feed.price_at(feed.local_to_feed_time(when), max_age=max_age)
 
     def feed_has_passed(self, pair: CurrencyPair, when: datetime) -> bool | None:
         """Whether the feed has already received a tick later than `when`
@@ -264,7 +341,9 @@ class PocketOptionProvider(MarketDataProvider):
 
     # -- messages --------------------------------------------------------
     def _connection_error_message(self, pair: CurrencyPair, exc: Exception) -> str:
-        base = f"Pocket Option error while subscribing to {pair.label}: {exc}"
+        base = (
+            f"Ошибка подключения Pocket Option для {pair.label} ({type(exc).__name__})"
+        )
         if self._ever_succeeded:
             return base
         return (
@@ -303,8 +382,8 @@ class PocketOptionProvider(MarketDataProvider):
         """
         client = await self._get_client()
         try:
-            await client.wait_for_assets()
-            assets = await client.active_assets()
+            await asyncio.wait_for(client.wait_for_assets(), timeout=15)
+            assets = await asyncio.wait_for(client.active_assets(), timeout=10)
         except Exception as exc:  # unofficial client: no fixed exception hierarchy
             raise MarketDataError(self._verify_connection_error_message(exc)) from exc
 
@@ -328,7 +407,7 @@ class PocketOptionProvider(MarketDataProvider):
         return pairs[0] if pairs else None
 
     def _verify_connection_error_message(self, exc: Exception) -> str:
-        base = f"Pocket Option connection check failed: {exc}"
+        base = f"Ошибка проверки Pocket Option ({type(exc).__name__})"
         if self._ever_succeeded:
             return base
         return (
@@ -345,10 +424,13 @@ class PocketOptionProvider(MarketDataProvider):
         """Which broker symbols are tradable right now, or None if the
         check itself failed ("couldn't check", not "nothing is active")."""
         try:
-            await client.wait_for_assets()
-            assets = await client.active_assets()
+            await asyncio.wait_for(client.wait_for_assets(), timeout=15)
+            assets = await asyncio.wait_for(client.active_assets(), timeout=10)
         except Exception:
-            logger.debug("active_assets() pre-check failed; skipping it for this request", exc_info=True)
+            logger.debug(
+                "active_assets() pre-check failed; skipping it for this request",
+                exc_info=True,
+            )
             return None
         return {
             item.get("symbol")
@@ -369,8 +451,8 @@ class PocketOptionProvider(MarketDataProvider):
 
         client = await self._get_client()
         try:
-            await client.wait_for_assets()
-            assets = await client.active_assets()
+            await asyncio.wait_for(client.wait_for_assets(), timeout=15)
+            assets = await asyncio.wait_for(client.active_assets(), timeout=10)
         except Exception:
             logger.debug(
                 "active_assets() failed while listing pairs; falling back to REGULAR_PAIRS",
@@ -389,7 +471,11 @@ class PocketOptionProvider(MarketDataProvider):
     @staticmethod
     def _inactive_asset_message(pair: CurrencyPair, active_symbols: set[str]) -> str:
         active_pairs = sorted(
-            (CurrencyPair(sym) for sym in active_symbols if _looks_like_currency_pair(sym)),
+            (
+                CurrencyPair(sym)
+                for sym in active_symbols
+                if _looks_like_currency_pair(sym)
+            ),
             key=lambda p: (p.is_otc, p.label),
         )
         if active_pairs:
@@ -410,6 +496,7 @@ class PocketOptionProvider(MarketDataProvider):
     async def aclose(self) -> None:
         for task in list(self._warmups):
             task.cancel()
+        await asyncio.gather(*list(self._warmups), return_exceptions=True)
         if self._client is not None:
             for feed in list(self._feeds.values()):
                 await feed.stop(self._client)

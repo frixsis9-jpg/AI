@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "files": [
+    {
+      "path": ".dockerignore",
+      "sha256": "b8fa2798046668cd2fca259bcea28f7eb627040280330ec7a2c772366388b612"
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "42d5cfc3764306fee2efc82823ad3ba50710c19f69c123766732163d1da333f2"
+    },
+    {
+      "path": "README.md",
+      "sha256": "ae089ff326b60c5dcb037eb1df3c5e2a663e4f5d54b00e0a848a173438c9ac6c"
+    },
+    {
+      "path": "DOCKER.md",
+      "sha256": "043c9ec49190bd285985961d25391de7252897367e208a77fdd72bb17059d8be"
+    },
+    {
+      "path": "SEARCH.md",
+      "sha256": "e5c92dc49d508695dd2470e54ff43321d17ad0b9d450d6871761a6ed814dc7b3"
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "0fed7aabb72681643bf07d37ff0ccec0febe99ea6ed45d7ab0a16498ad00a180"
+    },
+    {
+      "path": "main.py",
+      "sha256": "41d9b2059f17b2376d467b4c3a97236f76dc57d306f7880828ffb8bdf9de6a4f"
+    },
+    {
+      "path": "config.py",
+      "sha256": "a9fabe8a13fc62955cd3bb1b33e30556b158a14e86246daadb3a47be0fad9cf1"
+    },
+    {
+      "path": "domain.py",
+      "sha256": "9316098a7657e8891bc36eba18be30c81b4b797e33601366d6d958fc1957278f"
+    },
+    {
+      "path": "analysis/entry.py",
+      "sha256": "69757b18188a4d07c61676fe13d9b9c3ddbc5ec2fee137dbd2be224e2cccd18e"
+    },
+    {
+      "path": "analysis/multi_timeframe.py",
+      "sha256": "008ff6b6ee91332d977a79018dc1b085b48cf0a190392463486d21987d6f67f7"
+    },
+    {
+      "path": "analyst/advisor.py",
+      "sha256": "2009bb27cf8254748830b9f552633978aab61b708d2ff11f4bb286cff8537148"
+    },
+    {
+      "path": "bot/handlers/selection.py",
+      "sha256": "a9831996bdc0d8fb72307e8581b5a064f1d08de16e0575806634342e2e1965ca"
+    },
+    {
+      "path": "bot/handlers/signal.py",
+      "sha256": "9f2c5b3582451268698a20606dfa4ee6072ebb3f6c2f6bcf02bad3433b4a763a"
+    },
+    {
+      "path": "bot/handlers/start.py",
+      "sha256": "046c16da15f06fe0cd9f743eecab27b46cb40d93e232fb468084078608d5bb8c"
+    },
+    {
+      "path": "bot/handlers/stats.py",
+      "sha256": "2d2e68878bda39bba8ba34c8b03584a92ae12946e8dee217d09dc2ace9cdb94a"
+    },
+    {
+      "path": "bot/keyboards.py",
+      "sha256": "967bddb78e0f3e977d75a4318191dee21680c88b3b78b4722bd9420c07891b84"
+    },
+    {
+      "path": "bot/rendering.py",
+      "sha256": "bfe7482c5bbe8282dcbafa74e51f871ae51b67f2240b5be744fd454b833164d7"
+    },
+    {
+      "path": "market_data/live_feed.py",
+      "sha256": "ca9a0042d6ace0ff4a20723f3617e9e28214dec28f0eb0bce4c63e8243748cde"
+    },
+    {
+      "path": "market_data/pocket_option.py",
+      "sha256": "e7124a86c6c7220334c89b455cf62932adf78a142a1d54a0dcc5aa6e9559f9be"
+    },
+    {
+      "path": "market_data/snapshot.py",
+      "sha256": "5b9beb8bd02c0f60d718d279877fcf2bc449ae617acfdd2c018d1fcaaa449dcb"
+    },
+    {
+      "path": "storage/db.py",
+      "sha256": "b0860bda24e06ca66dcd6ae100100b79604a531b1d837969a150ac7b3eb0d175"
+    },
+    {
+      "path": "storage/models.py",
+      "sha256": "7c17c9615e5baa63c5e7f5a0ea8e3a7b2f49c45826650517c8cc8db119191834"
+    },
+    {
+      "path": "storage/repository.py",
+      "sha256": "32ccaba2a555a10e59e72825829480d0cb21d575890723108dcc42c5393ad68a"
+    },
+    {
+      "path": "storage/resolver.py",
+      "sha256": "28b201a5cd12009288998f964f7ed90ce9eafebc4538d8758d6a1849f8ac3834"
+    },
+    {
+      "path": "storage/fsm.py",
+      "sha256": "318cf65266a88c103f4e22b7ce8ed5728c9895176008f46e778ac11fc5c0d511"
+    },
+    {
+      "path": "scanner/__init__.py",
+      "sha256": "d598dcab28299f8ea108ce4a12bec375353714f93bbd49013c6fd6c272056b30"
+    },
+    {
+      "path": "scanner/service.py",
+      "sha256": "e0ae76e572b8a58c8a433dead1e04e24d00187a7326ce82cc59811ba408f415e"
+    }
+  ]
+}

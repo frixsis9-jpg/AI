@@ -1,4 +1,5 @@
 """Exercise actual callback routing with the empty FSM left by a restart."""
+
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock
 
@@ -24,6 +25,10 @@ async def test_old_keyboards_work_with_empty_state_and_across_submenus():
     provider = Mock()
     provider.list_available_pairs = AsyncMock(return_value=[CurrencyPair("EURUSD")])
     state = dispatcher.fsm.get_context(bot=bot, chat_id=42, user_id=42)
+    search = Mock()
+    search.start = AsyncMock()
+    search.stop = AsyncMock()
+    dispatcher["search"] = search
     counter = 0
 
     async def click(payload):
@@ -52,7 +57,10 @@ async def test_old_keyboards_work_with_empty_state_and_across_submenus():
         # The main menu still opens after all in-memory state was lost.
         methods = await click("menu:pair")
         assert await state.get_state() == SignalSetup.choosing_pair.state
-        assert any(isinstance(m, EditMessageText) and "Выберите валютную пару" in m.text for m in methods)
+        assert any(
+            isinstance(m, EditMessageText) and "Выберите валютную пару" in m.text
+            for m in methods
+        )
         assert any(isinstance(m, AnswerCallbackQuery) for m in methods)
 
         # A button in another old menu also works while a submenu is active.
@@ -66,17 +74,37 @@ async def test_old_keyboards_work_with_empty_state_and_across_submenus():
         assert await state.get_state() == SignalSetup.menu.state
         provider.warm_up.assert_called_once_with(CurrencyPair("EURUSD"))
 
-        for expiration in [next(iter(Expiration.selectable())).name, "AUTO"]:
+        for expiration in [e.name for e in Expiration.selectable()]:
             await state.clear()
             await click("exp:" + expiration)
             assert (await state.get_data())["expiration"] == expiration
             assert await state.get_state() == SignalSetup.menu.state
 
+        await state.clear()
+        methods = await click("exp:AUTO")
+        assert "expiration" not in await state.get_data()
+        assert any(isinstance(m, AnswerCallbackQuery) and m.show_alert for m in methods)
+
+        await state.update_data(expiration="SEC_10", pair="EURUSD")
+        await click("mode:auto")
+        assert (await state.get_data())["expiration"] == "SEC_10"
+        await click("search:start")
+        assert search.start.call_args.args[2].mode == "auto"
+        assert search.start.call_args.args[2].expiration.value == 10
+        await click("pair:GBPUSD")
+        assert (await state.get_data())["pair_mode"] == "manual"
+        assert search.stop.await_count > 0
+
         # A signal request with lost settings explains what to choose rather
         # than silently disappearing or starting an analysis with defaults.
         await state.clear()
         methods = await click("menu:signal")
-        assert any(isinstance(m, AnswerCallbackQuery) and m.show_alert and "Сначала выберите" in m.text for m in methods)
+        assert any(
+            isinstance(m, AnswerCallbackQuery)
+            and m.show_alert
+            and "Сначала выберите" in m.text
+            for m in methods
+        )
         provider.get_candles.assert_not_called()
     finally:
         await storage.close()

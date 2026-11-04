@@ -51,6 +51,7 @@ class PendingSignal:
     final_direction: Direction
     entry_price: float
     expires_at: datetime
+    model_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class StatsRow:
     losses: int
     unknown: int
     pending: int
+    model_version: str | None = None
 
     @property
     def total(self) -> int:
@@ -81,4 +83,4 @@ class StatsRow:
 
     @property
     def label(self) -> str:
-        return f"{self.pair.label} + {self.timeframe.value} + {self.expiration.label}"
+        return f"{self.pair.label} + {self.timeframe.value} + {self.expiration.label} [{self.model_version or 'legacy'}]"

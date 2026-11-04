@@ -1,9 +1,5 @@
-"""/stats — real signal outcomes: counts, win rate, and how well the shown
-probability matched reality (per probability bucket, current model only).
+"""Model outcomes, separated by pair/expiry/version; never actual broker fills."""
 
-Outcomes are settled by the exact tick at expiration (storage.resolver), so
-these numbers are what the broker would have paid, not an estimate.
-"""
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -18,7 +14,9 @@ router = Router(name="stats")
 @router.message(Command("stats"))
 async def cmd_stats(message: Message, repo: SignalRepository | None = None) -> None:
     if repo is None:
-        await message.answer("⚠️ Хранилище статистики не подключено (нет SignalRepository).")
+        await message.answer(
+            "⚠️ Хранилище статистики не подключено (нет SignalRepository)."
+        )
         return
 
     rows = await repo.get_stats()
@@ -30,17 +28,25 @@ async def cmd_stats(message: Message, repo: SignalRepository | None = None) -> N
 
     wins = sum(r.wins for r in rows)
     losses = sum(r.losses for r in rows)
-    lines = ["📈 Статистика сигналов", ""]
+    lines = [
+        "📈 Модельная статистика сигналов",
+        "Цена вашей ручной сделки может отличаться.",
+        "",
+    ]
     if wins + losses:
-        lines.append(f"Всего: ✅ {wins} / ❌ {losses} — винрейт {100 * wins / (wins + losses):.1f}%")
+        lines.append(
+            f"Всего: ✅ {wins} / ❌ {losses} — винрейт {100 * wins / (wins + losses):.1f}%"
+        )
 
     outcomes = await repo.resolved_outcomes(MODEL_VERSION)
     if outcomes:
-        lines += ["", f"Новая модель ({MODEL_VERSION}), по оценке вероятности:"]
+        lines += ["", f"Базовая модель ({MODEL_VERSION}), по оценке вероятности:"]
         for b in bucket_stats(outcomes):
             if b.total:
                 high = "+" if b.high > 100 else f"–{b.high:.0f}"
-                lines.append(f" • оценка {b.low:.0f}{high}%: реально {b.winrate:.0f}% (из {b.total})")
+                lines.append(
+                    f" • оценка {b.low:.0f}{high}%: реально {b.winrate:.0f}% (из {b.total})"
+                )
 
     lines += ["", "По комбинациям (валюта + таймфрейм + экспирация):"]
     for row in rows:

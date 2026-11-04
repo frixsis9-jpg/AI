@@ -1,28 +1,19 @@
-"""Entry point: wires up the bot, routers, market data provider and the
-SQLite signal repository/resolver.
+"""Telegram bot with persistent menu choices and conditional entry search."""
 
-No Claude client is created here anymore. The signal handler (bot/handlers/
-signal.py) runs a "fast" single-15-second-timeframe mode by request that
-always answers CALL/PUT and never WAIT — Claude's only role in this project
-was reviewing a signal and being able to downgrade it to WAIT, which directly
-conflicts with "always answer", so it's no longer wired in. ai/claude_client.py,
-ai/review.py and ai/prompt.py are untouched and still fully tested — re-adding
-the wiring here is the only step needed to bring Claude review back.
-"""
 import asyncio
 import logging
 import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.fsm.storage.memory import MemoryStorage
 from pydantic import ValidationError
 
-from analyst.claude_desk import ClaudeAnalyst, looks_like_api_key
 from bot.handlers import selection, signal, start, stats
 from market_data.models import MarketDataError
 from market_data.pocket_option import PocketOptionProvider
 from market_data.session_monitor import SessionMonitor, run_session_monitor_loop
+from scanner.service import SearchManager, SearchPolicy
+from storage.fsm import SQLiteStorage
 from storage.repository import SignalRepository
 from storage.resolver import run_resolver_loop
 
@@ -63,32 +54,25 @@ async def main() -> None:
     # and README, "Работа без ручного впн". Everything else (Pocket Option,
     # TwelveData) is unaffected. Left unset, aiogram connects directly, same
     # as before.
-    session = AiohttpSession(proxy=settings.telegram_proxy_url) if settings.telegram_proxy_url else None
+    session = (
+        AiohttpSession(proxy=settings.telegram_proxy_url)
+        if settings.telegram_proxy_url
+        else None
+    )
     bot = Bot(token=settings.telegram_bot_token, session=session)
     if settings.telegram_proxy_url:
-        logger.info("Telegram connection routed through proxy: %s", settings.telegram_proxy_url)
-    dispatcher = Dispatcher(storage=MemoryStorage())
+        logger.info("Telegram proxy enabled")
+    storage = SQLiteStorage(settings.database_path)
+    await storage.init()
+    dispatcher = Dispatcher(storage=storage)
     dispatcher.include_router(start.router)
     dispatcher.include_router(selection.router)
     dispatcher.include_router(signal.router)
     dispatcher.include_router(stats.router)
 
-    provider = PocketOptionProvider(ssid=settings.pocket_option_ssid)
-
-    # Optional Claude "senior analyst" note for the 🧠 Авто mode. Needs a real
-    # Anthropic API key (starts with "sk-ant-"); a placeholder would fail on
-    # every signal, so it's left off — with one clear line in the log.
-    analyst = None
-    if settings.analyst_enabled:
-        if looks_like_api_key(settings.anthropic_api_key):
-            analyst = ClaudeAnalyst(settings.anthropic_api_key, model=settings.anthropic_model)
-            logger.info("Claude analyst note enabled (model %s)", settings.anthropic_model)
-        else:
-            logger.warning(
-                "ANTHROPIC_API_KEY отсутствует или не похож на настоящий ключ Anthropic "
-                "(должен начинаться с 'sk-ant-') — комментарий ИИ-аналитика отключён. "
-                "Режим «🧠 Авто» работает без него."
-            )
+    provider = PocketOptionProvider(
+        ssid=settings.pocket_option_ssid, max_feeds=settings.search_max_feeds
+    )
 
     # One real connection attempt before we ever start polling Telegram: a
     # bad/expired SSID (well-formed but no longer valid — market_data/ssid.py
@@ -108,11 +92,22 @@ async def main() -> None:
             file=sys.stderr,
         )
         await provider.aclose()
+        await storage.close()
         await bot.session.close()
         raise SystemExit(1) from exc
 
     repo = SignalRepository(db_path=settings.database_path)
     await repo.init()
+    search = SearchManager(
+        provider,
+        bot,
+        repo,
+        SearchPolicy(
+            interval=settings.search_interval_seconds,
+            lead_seconds=settings.search_lead_seconds,
+            timezone=settings.search_timezone,
+        ),
+    )
 
     # Lets a hidden/background launch (see start_bot.vbs) confirm itself
     # without any visible console: if TELEGRAM_ADMIN_CHAT_ID is set, the
@@ -123,16 +118,23 @@ async def main() -> None:
     # itself may still work fine.
     if settings.telegram_admin_chat_id is not None:
         try:
-            await bot.send_message(settings.telegram_admin_chat_id, "✅ PocketSignalBot запущен и готов к работе.")
+            await bot.send_message(
+                settings.telegram_admin_chat_id,
+                "✅ PocketSignalBot запущен и готов к работе.",
+            )
         except Exception:
-            logger.exception("Could not send startup notification to TELEGRAM_ADMIN_CHAT_ID")
+            logger.exception(
+                "Could not send startup notification to TELEGRAM_ADMIN_CHAT_ID"
+            )
 
     # Outcomes are looked up by exact tick at the expiration instant, so the
     # interval only controls how soon /stats updates — but the fallback path
     # (no tick history) needs a prompt check, hence the 3-second ceiling.
     resolver_task = asyncio.create_task(
         run_resolver_loop(
-            repo, provider, interval_seconds=min(settings.resolver_interval_seconds, 3.0)
+            repo,
+            provider,
+            interval_seconds=min(settings.resolver_interval_seconds, 1.0),
         )
     )
 
@@ -154,7 +156,8 @@ async def main() -> None:
     )
     session_monitor_task = asyncio.create_task(
         run_session_monitor_loop(
-            session_monitor, interval_seconds=settings.pocket_option_health_check_interval_seconds
+            session_monitor,
+            interval_seconds=settings.pocket_option_health_check_interval_seconds,
         )
     )
 
@@ -162,8 +165,11 @@ async def main() -> None:
         # `provider=` and `repo=` are passed through aiogram's
         # dependency-injection mechanism: any handler that declares a
         # matching parameter name receives these instances automatically.
-        await dispatcher.start_polling(bot, provider=provider, repo=repo, analyst=analyst)
+        await dispatcher.start_polling(
+            bot, provider=provider, repo=repo, search=search, close_bot_session=False
+        )
     finally:
+        await search.close()
         resolver_task.cancel()
         session_monitor_task.cancel()
         for task in (resolver_task, session_monitor_task):
@@ -172,8 +178,7 @@ async def main() -> None:
             except asyncio.CancelledError:
                 pass
         await repo.aclose()
-        if analyst is not None:
-            await analyst.aclose()
+        await storage.close()
         await provider.aclose()
         await bot.session.close()
 

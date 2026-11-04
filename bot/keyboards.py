@@ -1,4 +1,5 @@
 """Inline keyboard builders for the selection flow."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -10,13 +11,19 @@ from domain import CurrencyPair, Expiration
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    # No "выбрать таймфрейм" step anymore — the bot analyzes several
-    # timeframes automatically per request (see analysis.multi_timeframe),
-    # so there's one fewer choice/step between opening the bot and a signal.
     builder = InlineKeyboardBuilder()
-    builder.button(text="💱 Выбрать валюту", callback_data="menu:pair")
-    builder.button(text="⌛ Выбрать экспирацию", callback_data="menu:expiration")
-    builder.button(text="📊 Получить сигнал", callback_data="menu:signal")
+    for text, action in [
+        ("💱 Выбрать пару вручную", "menu:pair"),
+        ("🔎 Автовыбор пары", "mode:auto"),
+        ("⌛ Выбрать экспирацию", "menu:expiration"),
+        ("🌐 Рынок автопоиска", "menu:market"),
+        ("☑ Список пар автопоиска", "menu:watchlist"),
+        ("▶ Начать поиск", "search:start"),
+        ("⏹ Остановить поиск", "search:stop"),
+        ("📊 Проверить сейчас", "menu:signal"),
+        ("ℹ Статус поиска", "search:status"),
+    ]:
+        builder.button(text=text, callback_data=action)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -53,13 +60,11 @@ def pair_keyboard(pairs: Sequence[CurrencyPair]) -> InlineKeyboardMarkup:
 
 
 def expiration_keyboard() -> InlineKeyboardMarkup:
-    """1 мин .. 1 ч (sub-minute expirations are no longer offered, see
-    Expiration.selectable) — laid out 4 per row to keep it compact."""
+    """Fixed expiry selected by the user, including experimental seconds."""
     builder = InlineKeyboardBuilder()
-    builder.button(text="🧠 Авто — аналитик подберёт", callback_data="exp:AUTO")
     for expiration in Expiration.selectable():
         builder.button(text=expiration.label, callback_data=f"exp:{expiration.name}")
-    builder.adjust(1, 4, 4)
+    builder.adjust(4)
     builder.row(_back_button())
     return builder.as_markup()
 
@@ -72,3 +77,31 @@ def new_signal_keyboard() -> InlineKeyboardMarkup:
 
 def _back_button() -> InlineKeyboardButton:
     return InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")
+
+
+def market_keyboard():
+    builder = InlineKeyboardBuilder()
+    for name, label in [
+        ("regular", "Обычные пары"),
+        ("otc", "Только OTC"),
+        ("both", "Оба рынка"),
+    ]:
+        builder.button(text=label, callback_data="market:" + name)
+    builder.adjust(1)
+    builder.row(_back_button())
+    return builder.as_markup()
+
+
+def watchlist_keyboard(pairs, selected):
+    builder = InlineKeyboardBuilder()
+    for pair in pairs:
+        builder.button(
+            text=("✅ " if str(pair) in selected else "▫ ") + pair.label,
+            callback_data="watch:" + str(pair),
+        )
+    builder.adjust(2)
+    builder.row(
+        InlineKeyboardButton(text="Все основные пары", callback_data="watch:all")
+    )
+    builder.row(_back_button())
+    return builder.as_markup()

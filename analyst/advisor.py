@@ -44,7 +44,7 @@ from market_data.models import Candle
 # manual-mode ones (the consensus probability is a different quantity).
 DESK_VERSION = f"{MODEL_VERSION}+desk"
 
-LADDER: tuple[Expiration, ...] = tuple(Expiration.selectable())  # 1m … 1h, ascending
+LADDER: tuple[Expiration, ...] = tuple(e for e in Expiration.selectable() if not e.is_short)  # 1m … 1h, ascending
 
 # Every timeframe any trio needs.
 ALL_TIMEFRAMES: tuple[Timeframe, ...] = tuple(
