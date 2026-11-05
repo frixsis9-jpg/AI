@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from analysis.entry import age_limit, evaluate, evaluate_manual
+from analysis.entry import age_limit, quote_age_limit, evaluate, evaluate_manual
 from analysis.support_resistance import Level
 from domain import Expiration
 from market_data.models import MarketDataError
@@ -84,3 +84,26 @@ def test_existing_closed_candle_analysis_does_not_change_with_forming_candle(
     b = analyze_multi_timeframe(s.pair, Expiration.MIN_3, changed, 2)
     assert a.logit == b.logit
     assert a.primary.current_price != b.primary.current_price
+
+
+def test_analysis_tolerates_small_quote_jitter_without_widening_settlement_limits(
+    candidate_factory, monkeypatch
+):
+    c = candidate_factory(Expiration.SEC_15, now=1_800_000_012)
+    monkeypatch.setattr(
+        "analysis.entry.analyze_multi_timeframe", lambda *args: c.result
+    )
+    jitter = replace(
+        c.snapshot, tick_time=c.snapshot.captured_at - 1.1, received_age=0.05
+    )
+    assert age_limit(Expiration.SEC_15) == 1
+    assert quote_age_limit(Expiration.SEC_15) == 1.25
+    assert evaluate_manual(jitter, Expiration.SEC_15).direction == c.direction
+    with pytest.raises(MarketDataError, match="устарела"):
+        jitter.validate(jitter.candles, max_age=age_limit(Expiration.SEC_15))
+    for bad in [
+        replace(jitter, tick_time=jitter.captured_at - 2),
+        replace(jitter, received_age=3),
+    ]:
+        with pytest.raises(MarketDataError, match="устарела"):
+            evaluate_manual(bad, Expiration.SEC_15)

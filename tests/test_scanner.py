@@ -423,7 +423,8 @@ async def test_unavailable_auto_group_has_bounded_warmup_before_trying_other_pai
 async def test_progress_keeps_updating_during_slow_data_fetch_and_stops_with_job(
     setup, monkeypatch
 ):
-    m, _, b, repo, clock = setup
+    m, provider, b, repo, clock = setup
+    provider.loading_status.return_value = "15S: 40/120, 1M: 120/120"
     monkeypatch.setattr("scanner.service.PROGRESS_INTERVAL_SECONDS", 0.01)
     waiting, updated = asyncio.Event(), asyncio.Event()
     calls = []
@@ -451,6 +452,7 @@ async def test_progress_keeps_updating_during_slow_data_fetch_and_stops_with_job
         clock.now += 1
         await asyncio.wait_for(updated.wait(), 1)
         assert all("Загружаю" in text for text in calls)
+        assert all("40/120" in text and "Загрузка:" in text for text in calls)
     finally:
         await m.stop(1, 2)
     assert not any(
@@ -606,3 +608,168 @@ async def test_unchanged_card_is_a_successful_delivery_without_duplicate_message
     await m._notify((1, 2), "✅ Сигнал")
     assert b.edit_message_text.await_count == 1
     b.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slow_history_for_one_request_does_not_hold_the_analysis_lock(
+    setup, candidate_factory, monkeypatch
+):
+    m, p, _, _, clock = setup
+    slow = asyncio.Event()
+
+    async def snapshot(pair, timeframes):
+        if pair == "EURUSD":
+            slow.set()
+            await asyncio.Event().wait()
+        return candidate_factory(now=clock(), pair=str(pair)).snapshot
+
+    p.get_snapshot = snapshot
+    del m.inspect
+    monkeypatch.setattr(
+        "scanner.service.evaluate_manual",
+        lambda s, exp: replace(
+            candidate_factory(exp, clock(), str(s.pair)), snapshot=s
+        ),
+    )
+    first = asyncio.create_task(
+        m.inspect(CurrencyPair("EURUSD"), Expiration.MIN_3, manual=True)
+    )
+    try:
+        await asyncio.wait_for(slow.wait(), 1)
+        second = await asyncio.wait_for(
+            m.inspect(CurrencyPair("GBPUSD"), Expiration.MIN_3, manual=True), 0.5
+        )
+        assert second.snapshot.pair == "GBPUSD"
+        assert not first.done()
+    finally:
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_loading_has_a_total_deadline(setup, monkeypatch):
+    from market_data.models import MarketDataError
+
+    m, p, _, _, _ = setup
+    monkeypatch.setattr("scanner.service.SNAPSHOT_TIMEOUT_SECONDS", 0.02)
+
+    async def blocked(*args):
+        await asyncio.Event().wait()
+
+    p.get_snapshot = blocked
+    p.loading_status.return_value = "15S: 0/120"
+    del m.inspect
+    with pytest.raises(MarketDataError, match="0/120"):
+        await asyncio.wait_for(
+            m.inspect(CurrencyPair("EURUSD"), Expiration.SEC_15, manual=True), 0.5
+        )
+
+
+@pytest.mark.asyncio
+async def test_borderline_quote_is_refreshed_before_rejecting_the_signal(
+    setup, candidate_factory, monkeypatch
+):
+    m, p, _, _, clock = setup
+    c = candidate_factory(Expiration.SEC_15, now=clock())
+    old = replace(c.snapshot, tick_time=clock() - 1.1)
+    p.get_snapshot = AsyncMock(side_effect=[old, c.snapshot])
+    del m.inspect
+    monkeypatch.setattr(
+        "scanner.service.evaluate_manual", lambda *args: replace(c, manual=True)
+    )
+    result = await m.inspect(c.snapshot.pair, Expiration.SEC_15, manual=True)
+    assert result.snapshot.tick_time == c.snapshot.tick_time
+    assert p.get_snapshot.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_confirmation_is_bounded_by_the_scheduled_entry_time(
+    setup, candidate_factory
+):
+    m, p, b, repo, clock = setup
+    m.policy = replace(m.policy, confirm_before=1.05)
+
+    async def blocked(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    m.inspect.side_effect = blocked
+    c = candidate_factory(now=clock())
+    await asyncio.wait_for(
+        m._attempt((1, 2), SearchOptions(Expiration.MIN_3, pair=c.snapshot.pair), c),
+        0.5,
+    )
+    assert clock() < m.progress[(1, 2)].entry_time
+    assert "обновить котировку" in b.edit_message_text.call_args.kwargs["text"]
+    repo.save_signal.assert_not_awaited()
+    p.release.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_problem_after_entry_preserves_issued_signal_instead_of_cancelling_it(
+    setup, candidate_factory
+):
+    m, _, b, repo, clock = setup
+    c = candidate_factory(now=clock())
+    options = SearchOptions(Expiration.SEC_15, pair=c.snapshot.pair)
+    m.progress[(1, 2)] = SearchPanel(
+        7,
+        "active",
+        "idle",
+        body="✅ РУЧНОЙ СИГНАЛ\nEUR/USD · ВВЕРХ",
+        options=options,
+        entry_time=clock() - 1,
+        final_issued=True,
+    )
+    await m._cancel((1, 2), options, c, "Котировка устарела")
+    text = b.edit_message_text.call_args.kwargs["text"]
+    assert text.startswith("✅ РУЧНОЙ СИГНАЛ")
+    assert "Сигнал сохранён" in text and "Вход отменён" not in text
+    assert repo.log_search.call_args.args[2] == "entry_unverified"
+    repo.save_signal.assert_not_awaited()
+    b.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_card_shows_price_from_entry_tick_separately_from_initial_reference(
+    setup,
+):
+    m, p, b, repo, _ = setup
+    p.price_at.return_value = 1.10017
+    m.progress[(1, 2)] = SearchPanel(7, "active", "idle")
+    await m._run(
+        (1, 2), SearchOptions(Expiration.MIN_3, pair=CurrencyPair("EURUSD")), True
+    )
+    assert any(
+        "Ориентир входа: 1.10010" in call.kwargs["text"]
+        for call in b.edit_message_text.call_args_list
+    )
+    text = b.edit_message_text.call_args.kwargs["text"]
+    assert "Уровень входа (по потоку): 1.10017" in text
+    assert "Ориентир входа" not in text
+    assert "Вход:" in "\n".join(text.splitlines()[:5])
+    assert repo.save_signal.call_args.args[0].entry_price == 1.10017
+    assert repo.save_signal.call_args.args[0].features["reference_price"] == 1.1001
+    b.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_one_point_one_second_quote_does_not_cancel_fifteen_second_signal(
+    setup, candidate_factory
+):
+    m, p, _, repo, clock = setup
+    exp = Expiration.SEC_15
+    c = candidate_factory(exp, clock())
+
+    async def recent_quote(*args, **kwargs):
+        fresh = candidate_factory(exp, clock())
+        return replace(
+            fresh,
+            manual=True,
+            snapshot=replace(fresh.snapshot, tick_time=clock() - 1.1),
+        )
+
+    m.inspect.side_effect = recent_quote
+    await m._attempt((1, 2), SearchOptions(exp, pair=c.snapshot.pair), c)
+    repo.save_signal.assert_awaited_once()
+    assert p.price_at.call_args.kwargs["max_age"] == 1
+    assert repo.save_signal.call_args.args[0].features["analysis_quote_max_age"] == 1.25

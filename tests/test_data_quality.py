@@ -123,7 +123,7 @@ def test_invalid_numeric_timestamps_are_rejected(snapshot_factory):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "large,upgrade,expected_requests",
-    [(False, False, 5), (True, False, 12), (True, True, 14)],
+    [(False, False, 4), (True, False, 11), (True, True, 14)],
 )
 async def test_real_feed_provider_backfills_only_requested_depth_from_native_ohlc(
     monkeypatch, large, upgrade, expected_requests
@@ -171,6 +171,13 @@ async def test_real_feed_provider_backfills_only_requested_depth_from_native_ohl
         ]
 
     client.get_candles_advanced = page
+    ticks_started = asyncio.Event()
+
+    async def blocked_tick_backfill(*args):
+        ticks_started.set()
+        await asyncio.Event().wait()
+
+    client.get_ticks = AsyncMock(side_effect=blocked_tick_backfill)
     provider = PocketOptionProvider("dummy", client=client)
     try:
         requested = [Timeframe.M1, Timeframe.M5, Timeframe.M15]
@@ -179,7 +186,7 @@ async def test_real_feed_provider_backfills_only_requested_depth_from_native_ohl
                 provider.get_snapshot(CurrencyPair("EURUSD"), requested), 3
             )
             first.validate(requested, max_age=2)
-            assert len(requests) == 5
+            assert len(requests) == 4
         if large:
             requested.append(Timeframe.H1)
         snap = await asyncio.wait_for(
@@ -192,10 +199,11 @@ async def test_real_feed_provider_backfills_only_requested_depth_from_native_ohl
         snap.validate(snap.candles, max_age=2)
         await asyncio.wait_for(provider._feeds["EURUSD"].backfill_attempted.wait(), 1)
         assert len(requests) == expected_requests
-        assert sum(period == 15 for period, span, end in requests) == 1
+        assert sum(period == 15 for period, span, end in requests) == 0
         assert sum(period == 60 for period, span, end in requests) == 1
         assert all(span == 150 * period for period, span, end in requests)
         assert all(end <= time.time() for period, span, end in requests)
+        await asyncio.wait_for(ticks_started.wait(), 1)
     finally:
         await provider.aclose()
     stream.unsubscribe.assert_awaited_once()
@@ -245,3 +253,69 @@ async def test_historical_tick_warmup_does_not_refresh_quote_age_or_change_last_
     assert f.last_price == 1.1 and f.feed_now == now - 0.1
     assert len(f._tick_ts) == 3
     assert list(f._tick_ts) == sorted(f._tick_ts)
+
+
+@pytest.mark.asyncio
+async def test_history_timeout_includes_waiting_for_another_assets_request(monkeypatch):
+    monkeypatch.setattr("market_data.live_feed.HISTORY_TIMEOUT_SECONDS", 0.02)
+    client = AsyncMock()
+    lock = asyncio.Lock()
+    await lock.acquire()
+    try:
+        rows = await asyncio.wait_for(
+            fetch_history_page(client, "EURUSD", 60, 0, lock, int(time.time())), 0.5
+        )
+        assert rows == []
+        client.get_candles_advanced.assert_not_awaited()
+    finally:
+        lock.release()
+
+
+@pytest.mark.asyncio
+async def test_missing_first_quote_for_one_pair_does_not_block_another_pair():
+    from unittest.mock import Mock
+    from domain import CurrencyPair
+    from market_data.pocket_option import PocketOptionProvider
+
+    started = asyncio.Event()
+
+    class Stream:
+        def __init__(self, silent):
+            self.silent = silent
+            self.unsubscribe = AsyncMock()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.silent:
+                started.set()
+                await asyncio.Event().wait()
+            await asyncio.sleep(0.005)
+            return {"time": time.time(), "price": 1.1}
+
+    streams = {"EURUSD": Stream(True), "GBPUSD": Stream(False)}
+    client = Mock()
+    client.subscribe_symbol = AsyncMock(side_effect=lambda symbol: streams[symbol])
+    client.wait_for_assets = AsyncMock()
+    client.active_assets = AsyncMock(
+        return_value=[{"symbol": s, "is_active": True} for s in streams]
+    )
+    client.get_candles_advanced = AsyncMock()
+    provider = PocketOptionProvider("dummy", client=client)
+    first = asyncio.create_task(provider._ensure_feed(CurrencyPair("EURUSD")))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        second = await asyncio.wait_for(
+            provider._ensure_feed(CurrencyPair("GBPUSD")), 0.5
+        )
+        assert second.last_price == 1.1
+        assert not first.done()
+        assert len(provider._feeds) == 2
+        client.get_candles_advanced.assert_not_awaited()
+    finally:
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        await provider.aclose()
+    for stream in streams.values():
+        stream.unsubscribe.assert_awaited_once()

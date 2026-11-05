@@ -43,6 +43,11 @@ def age_limit(expiration: Expiration) -> float:
     )
 
 
+def quote_age_limit(expiration: Expiration) -> float:
+    """Small analysis-only jitter tolerance; exact-time settlement stays strict."""
+    return age_limit(expiration) + 0.25
+
+
 @dataclass(frozen=True)
 class Candidate:
     snapshot: MarketSnapshot
@@ -51,6 +56,7 @@ class Candidate:
     reasons: tuple[str, ...]
     calculated_ms: float = 0.0
     manual: bool = False
+    loaded_ms: float = 0.0
 
     @property
     def direction(self):
@@ -63,7 +69,9 @@ def evaluate_manual(snapshot: MarketSnapshot, expiration: Expiration) -> Candida
     Quote freshness and complete candle history remain required inputs.
     Market selection gates belong to automatic search, not a manual report.
     """
-    snapshot.validate(timeframe_trio_for(expiration), max_age=age_limit(expiration))
+    snapshot.validate(
+        timeframe_trio_for(expiration), max_age=quote_age_limit(expiration)
+    )
     result = analyze_multi_timeframe(
         snapshot.pair, expiration, snapshot.candles, snapshot.price
     )
@@ -80,7 +88,7 @@ def evaluate_manual(snapshot: MarketSnapshot, expiration: Expiration) -> Candida
 
 def evaluate(snapshot: MarketSnapshot, expiration: Expiration) -> Candidate:
     trio = timeframe_trio_for(expiration)
-    snapshot.validate(trio, max_age=age_limit(expiration))
+    snapshot.validate(trio, max_age=quote_age_limit(expiration))
     result = analyze_multi_timeframe(
         snapshot.pair, expiration, snapshot.candles, snapshot.price
     )

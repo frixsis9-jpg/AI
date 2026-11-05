@@ -17,6 +17,7 @@ from bot.rendering import parse_selection, render_home_text, render_menu_text
 from bot.states import SignalSetup
 from bot.utils import safe_edit_text
 from domain import CurrencyPair, Expiration
+from analysis.multi_timeframe import timeframe_trio_for
 from market_data.provider import MarketDataProvider
 from scanner.service import ALLOWLIST, SearchOptions
 
@@ -129,7 +130,12 @@ async def open_expiration_menu(callback: CallbackQuery, state: FSMContext, searc
 
 
 @router.callback_query(F.data.startswith("exp:"))
-async def choose_expiration(callback: CallbackQuery, state: FSMContext, search=None):
+async def choose_expiration(
+    callback: CallbackQuery,
+    state: FSMContext,
+    search=None,
+    provider: MarketDataProvider | None = None,
+):
     try:
         expiration = Expiration[callback.data.split(":", 1)[1]]
         if expiration not in Expiration.selectable():
@@ -141,6 +147,9 @@ async def choose_expiration(callback: CallbackQuery, state: FSMContext, search=N
         return
     await stop_search(callback, search)
     await state.update_data(expiration=expiration.name)
+    data = await state.get_data()
+    if provider is not None and data.get("pair_mode") != "auto" and data.get("pair"):
+        provider.warm_up(CurrencyPair(data["pair"]), timeframe_trio_for(expiration))
     await callback.answer("Экспирация: " + expiration.label)
     await _show_main_menu(callback, state)
 

@@ -33,6 +33,7 @@ _PAIR_LIST_CACHE_SECONDS = 300.0
 
 # How long to wait for the first tick of a freshly started feed.
 _FIRST_TICK_TIMEOUT_SECONDS = 12.0
+_HISTORY_READY_TIMEOUT_SECONDS = 8.0
 
 # Feeds not used for this long are closed (resolver lookups count as use,
 # and the longest expiration is 1 h, so pending signals keep theirs alive).
@@ -152,51 +153,54 @@ class PocketOptionProvider(MarketDataProvider):
             return feed
 
         lock = self._feed_locks.setdefault(asset, asyncio.Lock())
-        async with lock, self._creation_lock:
+        async with lock:
             feed = self._feeds.get(asset)
             if feed is not None and not feed.is_stale:
                 feed.last_used_monotonic = time.monotonic()
                 return feed
 
-            client = await self._get_client()
-            if feed is not None:
-                logger.info(
-                    "Restarting stale feed for %s (tick age %s)", asset, feed.tick_age
-                )
-                await feed.stop(client)
-                self._feeds.pop(asset, None)
+            async with self._creation_lock:
+                client = await self._get_client()
+                if feed is not None:
+                    await feed.stop(client)
+                    self._feeds.pop(asset, None)
 
-            active_symbols = await self._list_active_pocket_option_symbols(client)
-            if active_symbols is not None and asset not in active_symbols:
-                raise MarketDataError(
-                    self._inactive_asset_message(pair, active_symbols)
-                )
-
-            await self._reap_idle_feeds(client)
-            feed = AssetFeed(asset)
-            if self._history_lock is None:
-                self._history_lock = asyncio.Lock()
-            try:
-                await feed.start(client, self._history_lock)
-            except asyncio.CancelledError:
-                await feed.stop(client)
-                raise
-            except Exception as exc:  # unofficial client: no fixed exception hierarchy
-                await feed.stop(client)
-                raise MarketDataError(
-                    self._connection_error_message(pair, exc)
-                ) from exc
+                active_symbols = await self._list_active_pocket_option_symbols(client)
+                if active_symbols is not None and asset not in active_symbols:
+                    raise MarketDataError(
+                        self._inactive_asset_message(pair, active_symbols)
+                    )
+                await self._reap_idle_feeds(client)
+                feed = AssetFeed(asset)
+                if self._history_lock is None:
+                    self._history_lock = asyncio.Lock()
+                try:
+                    await feed.start(client, self._history_lock)
+                except asyncio.CancelledError:
+                    await feed.stop(client)
+                    raise
+                except Exception as exc:
+                    await feed.stop(client)
+                    raise MarketDataError(
+                        self._connection_error_message(pair, exc)
+                    ) from exc
+                # Reserve the slot before waiting; slow quotes/history must not
+                # hold the creation lock for every other asset.
+                self._feeds[asset] = feed
 
             try:
                 received = await feed.wait_first_tick(_FIRST_TICK_TIMEOUT_SECONDS)
             except asyncio.CancelledError:
                 await feed.stop(client)
+                if self._feeds.get(asset) is feed:
+                    self._feeds.pop(asset)
                 raise
             if not received:
                 await feed.stop(client)
+                if self._feeds.get(asset) is feed:
+                    self._feeds.pop(asset)
                 raise FeedUnavailableError(feed.error or self._no_quotes_message(pair))
 
-            self._feeds[asset] = feed
             self._ever_succeeded = True
             return feed
 
@@ -241,7 +245,7 @@ class PocketOptionProvider(MarketDataProvider):
     ) -> MarketSnapshot:
         feed = await self._ensure_feed(pair)
         feed.request_history(timeframes)
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _HISTORY_READY_TIMEOUT_SECONDS
         while (
             not feed.closed
             and not feed.backfill_attempted.is_set()
@@ -293,20 +297,36 @@ class PocketOptionProvider(MarketDataProvider):
         except Exception as exc:
             raise MarketDataError("Не удалось проверить список активных валют") from exc
 
-    def warm_up(self, pair: CurrencyPair) -> None:
+    def warm_up(self, pair: CurrencyPair, timeframes=None) -> None:
         """Starts the pair's feed in the background (called the moment a
         user picks a pair), so by the time they press "Получить сигнал" the
         history is already loaded. Never raises."""
 
         async def run() -> None:
             try:
-                await self._ensure_feed(pair)
+                feed = await self._ensure_feed(pair)
+                if timeframes:
+                    feed.request_history(timeframes)
             except Exception as exc:  # noqa: BLE001 - background prefetch
                 logger.info("Warm-up for %s failed: %s", pair, exc)
 
         task = asyncio.create_task(run(), name=f"warmup:{pair}")
         self._warmups.add(task)
         task.add_done_callback(self._warmups.discard)
+
+    def loading_status(self, pair, timeframes):
+        feed = self._feeds.get(str(pair))
+        if feed is None:
+            return "Подключаю поток котировок"
+        if feed.closed:
+            return feed.error or "Поток котировок остановлен"
+        if feed.last_price is None:
+            return "Ожидаю первую котировку от источника"
+        counts = ", ".join(
+            f"{tf.value}: {min(120, sum(c.is_closed for c in feed.candles(tf.seconds, tf.pocket_option_base.period_seconds)))}/120"
+            for tf in timeframes
+        )
+        return f"{feed.loading_status}. {counts}"
 
     async def get_candles(
         self,

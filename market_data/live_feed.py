@@ -65,21 +65,21 @@ async def fetch_history_page(
     """
     wanted = min(count or PAGE_ROWS, PAGE_ROWS)
     end = platform_now - page * PAGE_ROWS * period
-    async with lock:
-        try:
-            rows = await asyncio.wait_for(
-                client.get_candles_advanced(asset, period, wanted * period, end),
-                timeout=HISTORY_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            logger.warning(
-                "OHLC history unavailable for %s/%ss/page%d (%s)",
-                asset,
-                period,
-                page,
-                type(exc).__name__,
-            )
-            return []
+    try:
+        async with asyncio.timeout(HISTORY_TIMEOUT_SECONDS):
+            async with lock:
+                rows = await client.get_candles_advanced(
+                    asset, period, wanted * period, end
+                )
+    except Exception as exc:
+        logger.warning(
+            "OHLC history unavailable for %s/%ss/page%d (%s)",
+            asset,
+            period,
+            page,
+            type(exc).__name__,
+        )
+        return []
     return [r for r in rows or [] if isinstance(r, dict)]
 
 
@@ -275,6 +275,7 @@ class AssetFeed:
         self.last_tick_monotonic: float | None = None
         self.last_used_monotonic = time.monotonic()
         self.history_loaded = False
+        self.loading_status = "Ожидаю запрос истории"
         self.backfill_attempted = asyncio.Event()
         self.required_rows = {p: 0 for p in BASE_PERIODS}
         self._history_requested = asyncio.Event()
@@ -283,26 +284,17 @@ class AssetFeed:
         self._repair_needed = asyncio.Event()
         self._reader: asyncio.Task | None = None
         self._maintainer: asyncio.Task | None = None
+        self._tick_primer: asyncio.Task | None = None
         self._stream = None
         self.closed = False
         self.error: str | None = None
 
     # -- lifecycle -------------------------------------------------------
     async def start(self, client, lock: asyncio.Lock | None = None) -> None:
-        """Start one tick subscription, seed recent native OHLC pages, and
-        deepen history in the background using serialized requests."""
+        """Start live ticks promptly; requested history loads in the background."""
         lock = lock or asyncio.Lock()
         self._stream = await client.subscribe_symbol(self.asset)
         self._reader = asyncio.create_task(self._read(), name=f"ticks:{self.asset}")
-        for period in BASE_PERIODS:
-            await self._load_pages(client, lock, period, range(0, 1))
-        await self._prime_recent_ticks(client, lock)
-        self.history_loaded = any(len(s) > 0 for s in self.series.values())
-        logger.info(
-            "Feed %s seeded: %s",
-            self.asset,
-            ", ".join(f"{p}s={len(self.series[p])}" for p in BASE_PERIODS),
-        )
         self._maintainer = asyncio.create_task(
             self._maintain(client, lock), name=f"history:{self.asset}"
         )
@@ -373,6 +365,7 @@ class AssetFeed:
             )
         finally:
             self.closed = True
+            self._first_tick.set()
 
     def on_tick(self, ts: float, price: float) -> None:
         if not math.isfinite(ts) or not math.isfinite(price) or price <= 0:
@@ -409,6 +402,7 @@ class AssetFeed:
         loaded = 0
         platform_now = int(time.time()) + PLATFORM_TIME_OFFSET
         for page in pages:
+            self.loading_status = f"Загружаю историю {period} с, страница {page + 1}"
             rows = await fetch_history_page(
                 client,
                 self.asset,
@@ -419,6 +413,7 @@ class AssetFeed:
                 count=PAGE_ROWS if recent else MAX_ROWS[period],
             )
             if not rows:
+                self.loading_status = f"Источник не отдал историю {period} с"
                 break  # no older data (or a failure) — deeper pages won't help
             self.series[period].seed(rows)
             loaded += len(rows)
@@ -426,6 +421,7 @@ class AssetFeed:
 
     async def _maintain(self, client, lock: asyncio.Lock) -> None:
         """Backfill requested timeframes and repair recent bars periodically."""
+        primed_ticks = False
         try:
             while not self.closed:
                 self._history_requested.clear()
@@ -434,10 +430,11 @@ class AssetFeed:
                 for period, needed in targets.items():
                     if len(self.series[period]) < needed:
                         pages = (needed + PAGE_ROWS - 1) // PAGE_ROWS
-                        await self._load_pages(client, lock, period, range(1, pages))
+                        await self._load_pages(client, lock, period, range(0, pages))
                 if revision != self._history_revision:
                     continue  # a longer expiry was requested during the fetch
                 self.backfill_attempted.set()
+                self.history_loaded = any(len(s) > 0 for s in self.series.values())
                 logger.debug(
                     "Feed %s requested history coverage: %s",
                     self.asset,
@@ -448,6 +445,17 @@ class AssetFeed:
                     ),
                 )
                 missing = any(len(self.series[p]) < n for p, n in targets.items())
+                if not missing and any(targets.values()):
+                    self.loading_status = "История загружена"
+                if not primed_ticks and any(targets.values()):
+                    primed_ticks = True
+                    # The pinned engine correlates tick/candle responses. An
+                    # optional tick backfill must not occupy the candle queue
+                    # or delay a later request for a deeper timeframe.
+                    self._tick_primer = asyncio.create_task(
+                        self._prime_recent_ticks(client, asyncio.Lock()),
+                        name=f"tick-history:{self.asset}",
+                    )
                 delay = 5.0 if missing else REFRESH_SECONDS
                 repairs = asyncio.create_task(self._repair_needed.wait())
                 requested = asyncio.create_task(self._history_requested.wait())
@@ -464,7 +472,7 @@ class AssetFeed:
                 if self._history_requested.is_set():
                     continue  # prioritize the new depth before periodic repairs
                 self._repair_needed.clear()
-                for period in BASE_PERIODS:
+                for period in (p for p, needed in self.required_rows.items() if needed):
                     await self._load_pages(
                         client, lock, period, range(0, 1), recent=True
                     )
@@ -476,13 +484,14 @@ class AssetFeed:
     async def wait_first_tick(self, timeout: float) -> bool:
         try:
             await asyncio.wait_for(self._first_tick.wait(), timeout)
-            return True
+            return not self.closed and self.last_price is not None
         except TimeoutError:
             return False
 
     async def stop(self, client) -> None:
         self.closed = True
-        for task in (self._maintainer, self._reader):
+        self._first_tick.set()  # wake a creation waiter if this feed was replaced
+        for task in (self._maintainer, self._tick_primer, self._reader):
             if task is None:
                 continue
             task.cancel()

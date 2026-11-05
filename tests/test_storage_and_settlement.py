@@ -94,8 +94,8 @@ async def test_pinned_feeds_are_not_evicted_and_cancel_releases_only_own_lease()
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_history_start_explicitly_unsubscribes():
-    import time
+async def test_cancel_before_first_quote_explicitly_unsubscribes():
+    started = asyncio.Event()
 
     class Stream:
         def __init__(self):
@@ -105,8 +105,8 @@ async def test_cancel_during_history_start_explicitly_unsubscribes():
             return self
 
         async def __anext__(self):
-            await asyncio.sleep(0.01)
-            return {"timestamp": time.time(), "price": 1.1}
+            started.set()
+            await asyncio.Event().wait()
 
     client = Mock()
     stream = Stream()
@@ -115,18 +115,18 @@ async def test_cancel_during_history_start_explicitly_unsubscribes():
     client.active_assets = AsyncMock(
         return_value=[{"symbol": "EURUSD", "is_active": True}]
     )
-    started = asyncio.Event()
-
-    async def hold(*args):
-        started.set()
-        await asyncio.Event().wait()
-
-    client.get_candles_advanced = hold
+    client.get_candles_advanced = AsyncMock()
     p = PocketOptionProvider("dummy", client=client)
     task = asyncio.create_task(p._ensure_feed(CurrencyPair("EURUSD")))
-    await asyncio.wait_for(started.wait(), 1)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    stream.unsubscribe.assert_awaited_once()
-    assert not p._feeds
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        stream.unsubscribe.assert_awaited_once()
+        assert not p._feeds
+        client.get_candles_advanced.assert_not_awaited()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await p.aclose()

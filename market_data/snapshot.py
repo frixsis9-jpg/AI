@@ -43,7 +43,7 @@ class MarketSnapshot:
             )
         if self.age > max_age:
             raise MarketDataError(
-                f"Котировка устарела: {self.age:.1f} с; допустимо {max_age:.1f} с"
+                f"Котировка устарела: {self.age:.3f} с; допустимо {max_age:.3f} с"
             )
         for tf in timeframes:
             closed = [c for c in self.candles.get(tf, []) if c.is_closed][-count:]

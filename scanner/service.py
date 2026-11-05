@@ -20,6 +20,7 @@ from analysis.entry import (
     age_limit,
     evaluate,
     evaluate_manual,
+    quote_age_limit,
 )
 from analysis.errors import AnalysisError
 from analysis.multi_timeframe import timeframe_trio_for
@@ -37,6 +38,8 @@ ALLOWLIST = tuple(str(p) for p in REGULAR_PAIRS) + (
 )
 MARKETS = {"regular": "Обычные пары", "otc": "Только OTC", "both": "Обычные + OTC"}
 PROGRESS_INTERVAL_SECONDS = 5.0
+SNAPSHOT_TIMEOUT_SECONDS = 15.0
+FRESH_TICK_WAIT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,8 @@ class SearchPanel:
     restored: bool = False
     rendered: tuple | None = None
     options: SearchOptions | None = None
+    entry_time: float | None = None
+    final_issued: bool = False
 
 
 class SearchManager:
@@ -97,6 +102,7 @@ class SearchManager:
         self.checks = {}
         self.coverage = {}
         self.analysis_lock = asyncio.Lock()
+        self.loading = {}
 
     def status(self, chat, user):
         return self.statuses.get((chat, user), "Поиск остановлен")
@@ -119,6 +125,7 @@ class SearchManager:
                 pass
         self.statuses[key] = "Поиск остановлен"
         self.progress.pop(key, None)
+        self.loading.pop(key, None)
 
     async def start(self, chat, user, options, *, once=False, progress=None):
         options.validate()
@@ -143,6 +150,13 @@ class SearchManager:
     def _panel_text(self, key, panel):
         options = panel.options
         status = self.statuses.get(key, "")
+        loading = self.loading.get(key)
+        if loading and status.startswith("⏳"):
+            pair, started = loading
+            detail = self._loading_detail(pair, options.expiration)
+            status += f"\nЗагрузка: {time.monotonic() - started:.0f} с."
+            if detail:
+                status += "\n" + detail
         round_number, visited, total = self.coverage.get(key, (0, 0, 0))
         coverage = (
             f"\nОбход №{round_number}: {visited} из {total} пар."
@@ -275,20 +289,52 @@ class SearchManager:
             **details,
         )
 
+    def _loading_detail(self, pair, expiration):
+        describe = getattr(self.provider, "loading_status", None)
+        detail = (
+            describe(pair, timeframe_trio_for(expiration)) if callable(describe) else ""
+        )
+        return detail if isinstance(detail, str) else ""
+
     async def inspect(self, pair, expiration, *, manual=False):
-        async with self.analysis_lock:
-            snapshot = await asyncio.wait_for(
+        loading_started = time.perf_counter()
+        deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
+
+        async def read_snapshot():
+            return await asyncio.wait_for(
                 self.provider.get_snapshot(pair, timeframe_trio_for(expiration)),
-                timeout=45,
+                timeout=max(0.001, deadline - time.monotonic()),
             )
+
+        try:
+            snapshot = await read_snapshot()
+            refresh_until = min(deadline, time.monotonic() + FRESH_TICK_WAIT_SECONDS)
+            while (
+                snapshot.age > age_limit(expiration)
+                and time.monotonic() < refresh_until
+            ):
+                await asyncio.sleep(0.05)
+                snapshot = await read_snapshot()
+        except TimeoutError as exc:
+            detail = self._loading_detail(pair, expiration)
+            raise MarketDataError(
+                f"Не удалось загрузить данные {pair.label} за {time.perf_counter() - loading_started:.1f} с. {detail}"
+            ) from exc
+        loaded_ms = (time.perf_counter() - loading_started) * 1000
+        # History for one asset must not hold the CPU lock for every other user.
+        async with self.analysis_lock:
             start = time.perf_counter()
             evaluator = evaluate_manual if manual else evaluate
             candidate = await asyncio.to_thread(evaluator, snapshot, expiration)
             # Recheck age AFTER computation and waiting for the worker thread.
-            if self.clock() - snapshot.tick_time > age_limit(expiration):
+            if snapshot.age + max(
+                0, self.clock() - snapshot.captured_at
+            ) > quote_age_limit(expiration):
                 raise MarketDataError("Котировка устарела во время расчёта")
             return replace(
-                candidate, calculated_ms=(time.perf_counter() - start) * 1000
+                candidate,
+                calculated_ms=(time.perf_counter() - start) * 1000,
+                loaded_ms=loaded_ms,
             )
 
     async def _pairs(self, options):
@@ -351,6 +397,7 @@ class SearchManager:
                         self.statuses[key] = (
                             f"⏳ Загружаю и проверяю свечи {pair.label}…"
                         )
+                        self.loading[key] = (pair, time.monotonic())
                         await self._show_progress(key, options, force=cycles == 0)
                         try:
                             c = await self.inspect(
@@ -386,6 +433,7 @@ class SearchManager:
                             detail = f"{prefix}. {pair.label}: {reason}"
                             failures.append(detail)
                         finally:
+                            self.loading.pop(key, None)
                             visited.add(pair)
                             self.coverage[key] = (
                                 round_number,
@@ -465,16 +513,29 @@ class SearchManager:
         except asyncio.CancelledError:
             if pending:
                 try:
-                    await asyncio.wait_for(
-                        self._notify(
-                            key,
-                            "⛔ "
-                            + pending.snapshot.pair.label
-                            + ": запланированный вход отменён — поиск остановлен или настройки изменены",
-                            active=False,
-                        ),
-                        timeout=2,
-                    )
+                    panel = self.progress.get(key)
+                    if (
+                        panel
+                        and panel.entry_time is not None
+                        and self.clock() >= panel.entry_time
+                    ):
+                        self.statuses[key] = (
+                            "Поиск остановлен. Ранее выданный сигнал сохранён."
+                        )
+                        await self._show_progress(
+                            key, options, active=False, force=True
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            self._notify(
+                                key,
+                                "⛔ "
+                                + pending.snapshot.pair.label
+                                + ": запланированный вход отменён — поиск остановлен или настройки изменены",
+                                active=False,
+                            ),
+                            timeout=2,
+                        )
                     await self._event(
                         key, "cancelled", options, pending, reason="stopped"
                     )
@@ -500,7 +561,7 @@ class SearchManager:
     def _time(self, ts):
         return datetime.fromtimestamp(ts, self.tz).strftime("%d.%m %H:%M:%S")
 
-    def _summary(self, c, entry=None):
+    def _summary(self, c, entry=None, entry_price=None):
         r = c.result
         notes = [f"• [{n.timeframe.value}] {n.text}" for n in r.pros[:2]]
         if r.cons:
@@ -513,7 +574,11 @@ class SearchManager:
                 if entry is not None
                 else ""
             )
-            + f"Цена на момент анализа: {c.snapshot.price:.5f}\n"
+            + (
+                f"📍 Ориентир входа: {c.snapshot.price:.5f}\n"
+                if entry_price is None
+                else f"📍 Уровень входа (по потоку): {entry_price:.5f}\n"
+            )
             + (
                 ""
                 if c.manual
@@ -521,10 +586,24 @@ class SearchManager:
             )
             + "\n".join("• " + reason for reason in c.reasons)
             + ("\n" + "\n".join(notes) if notes else "")
-            + f"\nРасчёт: {c.calculated_ms:.0f} мс"
+            + f"\nЗагрузка данных: {c.loaded_ms / 1000:.1f} с · Расчёт: {c.calculated_ms:.0f} мс"
         )
 
     async def _cancel(self, key, options, c, reason):
+        panel = self.progress.get(key)
+        if panel and panel.entry_time is not None and self.clock() >= panel.entry_time:
+            self.statuses[key] = (
+                (
+                    "Сигнал сохранён. Не удалось зафиксировать котировку в момент входа: "
+                    if panel.final_issued
+                    else "Подтверждение не завершилось до указанного времени входа: "
+                )
+                + reason
+                + ". Результат этой попытки не включён в статистику."
+            )
+            await self._event(key, "entry_unverified", options, c, reason=reason)
+            await self._show_progress(key, options, active=False, force=True)
+            return
         self.statuses[key] = "Вход отменён: " + reason
         await self._event(key, "cancelled", options, c, reason=reason)
         try:
@@ -559,6 +638,9 @@ class SearchManager:
 
     async def _execute(self, key, options, c, entry):
         expiration = options.expiration
+        panel = self.progress.get(key)
+        if panel:
+            panel.entry_time, panel.final_issued = entry, False
         self.statuses[key] = "Подготовка входа " + self._time(entry)
         await self._event(
             key, "prepared", options, c, entry_at=entry, quality=c.quality
@@ -566,14 +648,14 @@ class SearchManager:
         rtt = await self._notify(
             key,
             (
-                "📊 РУЧНОЙ АНАЛИЗ\n"
+                "📊 РУЧНОЙ АНАЛИЗ · предварительно\n"
                 if options.mode == "manual"
                 else "🟡 ПРЕДВАРИТЕЛЬНО\n"
             )
             + self._summary(c, entry)
             + "\n"
             + (
-                "Направление уточняется перед указанным временем входа.\n"
+                "Ожидайте итогового сигнала до указанного времени входа.\n"
                 if options.mode == "manual"
                 else "Ожидайте подтверждения. При отмене или опоздании вход пропускается.\n"
             )
@@ -583,6 +665,10 @@ class SearchManager:
                 else ""
             ),
         )
+        panel = self.progress.get(key)
+        if panel:
+            panel.entry_time = entry
+            panel.final_issued = False
         budget = min(2.0, expiration.value / 10)
         if rtt > budget or self.clock() > entry - self.policy.confirm_before:
             await self._cancel(
@@ -591,11 +677,19 @@ class SearchManager:
             return
         await self.sleep(max(0, entry - self.policy.confirm_before - self.clock()))
         try:
-            fresh = await self.inspect(
-                c.snapshot.pair, expiration, manual=options.mode == "manual"
+            fresh = await asyncio.wait_for(
+                self.inspect(
+                    c.snapshot.pair, expiration, manual=options.mode == "manual"
+                ),
+                timeout=max(0.001, entry - 1 - self.clock()),
             )
         except (MarketDataError, AnalysisError, TimeoutError) as exc:
-            await self._cancel(key, options, c, str(exc))
+            await self._cancel(
+                key,
+                options,
+                c,
+                str(exc) or "Не удалось обновить котировку до подтверждения входа",
+            )
             return
         atr = c.result.primary.indicators.atr
         if options.mode == "auto" and (
@@ -606,27 +700,33 @@ class SearchManager:
             await self._cancel(key, options, c, "направление или цена изменились")
             return
         if (
-            self.clock() - fresh.snapshot.tick_time > age_limit(expiration)
+            self.clock() - fresh.snapshot.tick_time > quote_age_limit(expiration)
             or self.clock() > entry - 1
         ):
             await self._cancel(key, options, c, "проверка завершилась слишком поздно")
             return
-        rtt = await self._notify(
-            key,
-            (
-                "✅ РУЧНОЙ СИГНАЛ\n"
-                if options.mode == "manual"
-                else "✅ ПЛАН ПОДТВЕРЖДЁН\n"
+
+        def confirmed_text(entry_price=None):
+            return (
+                (
+                    "✅ РУЧНОЙ СИГНАЛ\n"
+                    if options.mode == "manual"
+                    else "✅ ПЛАН ПОДТВЕРЖДЁН\n"
+                )
+                + self._summary(fresh, entry, entry_price)
+                + (
+                    "\nНаправление обновлено после повторного анализа."
+                    if options.mode == "manual" and fresh.direction != c.direction
+                    else ""
+                )
+                + f"\nРасчётное завершение: {self._time(entry + expiration.value)}"
+                + "\nПри пропуске времени не догоняйте движение."
             )
-            + self._summary(fresh, entry)
-            + (
-                "\nНаправление обновлено после повторного анализа."
-                if options.mode == "manual" and fresh.direction != c.direction
-                else ""
-            )
-            + f"\nРасчётное завершение: {self._time(entry + expiration.value)}"
-            + "\nПри пропуске времени не догоняйте движение.",
-        )
+
+        rtt = await self._notify(key, confirmed_text())
+        panel = self.progress.get(key)
+        if panel:
+            panel.final_issued = True
         if rtt > budget or self.clock() > entry - 0.5:
             await self._cancel(key, options, c, "подтверждение задержалось")
             return
@@ -672,12 +772,20 @@ class SearchManager:
                 "tick_age": fresh.snapshot.age,
                 "calculated_ms": fresh.calculated_ms,
                 "confirmation_api_seconds": rtt,
+                "reference_price": fresh.snapshot.price,
+                "analysis_quote_max_age": quote_age_limit(expiration),
+                "loaded_ms": fresh.loaded_ms,
             },
         )
         signal_id = await self.repo.save_signal(record)
         await self._event(
             key, "entered", options, c, signal_id=signal_id, entry_at=entry, price=price
         )
+        panel = self.progress.get(key)
+        if panel:
+            async with self.panel_locks.setdefault(key, asyncio.Lock()):
+                if self.progress.get(key) is panel:
+                    panel.body = confirmed_text(price)
         self.statuses[key] = "Вход зафиксирован; продолжаю поиск после паузы"
         return True
 
