@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from domain import CurrencyPair, Expiration
-from scanner.service import SearchManager, SearchOptions
+from scanner.service import SearchManager, SearchOptions, SearchPanel
 
 
 class Clock:
@@ -41,7 +41,8 @@ def setup(candidate_factory):
         ]
     )
     bot = Mock()
-    bot.send_message = AsyncMock()
+    bot.send_message = AsyncMock(return_value=Mock(message_id=7))
+    bot.edit_message_text = AsyncMock()
     repo = Mock()
     repo.log_search = AsyncMock()
     repo.save_signal = AsyncMock(return_value=7)
@@ -87,7 +88,8 @@ async def test_scheduled_entry_rechecks_and_records_target_not_notice_time(
     assert (record.expires_at - record.created_at).total_seconds() == seconds
     assert record.confidence is None
     assert record.model_version == "entry-v1"
-    assert len(b.send_message.call_args_list) == 2
+    assert len(b.send_message.call_args_list) == 1
+    assert "ПЛАН ПОДТВЕРЖДЁН" in b.edit_message_text.call_args.kwargs["text"]
     p.release.assert_not_called()  # retained until the expiry lookup
     m.inspect.assert_awaited_once()
     assert p.price_at.call_args.kwargs["max_age"] <= 5
@@ -104,7 +106,7 @@ async def test_changed_direction_cancels_and_releases_lease(setup, candidate_fac
     )
     repo.save_signal.assert_not_awaited()
     p.release.assert_called_once_with("lease")
-    assert "отменён" in b.send_message.call_args.args[1]
+    assert "отменён" in b.edit_message_text.call_args.kwargs["text"]
 
 
 @pytest.mark.asyncio
@@ -203,7 +205,8 @@ async def test_cancel_pending_plan_delivers_cancellation_and_releases_feed(
     await asyncio.wait_for(waiting.wait(), 2)
     await m.stop(1, 2)
     repo.save_signal.assert_not_awaited()
-    assert any("отменён" in c.args[1] for c in b.send_message.call_args_list)
+    assert "отменён" in b.edit_message_text.call_args.kwargs["text"]
+    assert b.send_message.await_count == 1
     p.release.assert_called_once()
 
 
@@ -257,13 +260,15 @@ async def test_notification_failure_after_preliminary_cancels_plan(
     setup, candidate_factory
 ):
     from aiogram.exceptions import TelegramNetworkError
-    from aiogram.methods import SendMessage
+    from aiogram.methods import EditMessageText
 
     m, p, b, repo, clock = setup
-    b.send_message.side_effect = [
+    m.progress[(1, 2)] = SearchPanel(7, "active", "idle")
+    b.edit_message_text.side_effect = [
         Mock(),
         TelegramNetworkError(
-            method=SendMessage(chat_id=1, text="test"), message="offline"
+            method=EditMessageText(chat_id=1, message_id=7, text="test"),
+            message="offline",
         ),
         Mock(),
     ]
@@ -272,7 +277,8 @@ async def test_notification_failure_after_preliminary_cancels_plan(
     repo.save_signal.assert_not_awaited()
     p.release.assert_called_once()
     assert "отменён" in m.status(1, 2)
-    assert "⛔" in b.send_message.call_args.args[1]
+    assert "⛔" in b.edit_message_text.call_args.kwargs["text"]
+    b.send_message.assert_not_awaited()
 
 
 def test_message_keeps_existing_factor_explanations_without_claiming_probability(
@@ -309,18 +315,24 @@ async def test_manual_check_reports_weak_direction_entry_time_and_allows_another
     p.get_snapshot = snapshot
     del m.inspect
     m.cooldowns[((1, 2), "EURUSD", 180, "CALL")] = clock() + 1000
-    m.progress[(1, 2)] = (7, "active_markup", "idle_markup")
+    m.progress[(1, 2)] = SearchPanel(7, "active_markup", "idle_markup")
     m.last_progress[(1, 2)] = 0
     b.edit_message_text = AsyncMock()
     for _ in range(2):
         await m._run(
             (1, 2), SearchOptions(Expiration.MIN_3, pair=CurrencyPair("EURUSD")), True
         )
-    messages = [call.args[1] for call in b.send_message.call_args_list]
-    assert len(messages) == 4
+    b.send_message.assert_not_awaited()
+    messages = [
+        call.kwargs["text"]
+        for call in b.edit_message_text.call_args_list
+        if call.kwargs["text"].startswith(("📊", "✅"))
+    ]
+    assert len(messages) >= 4
     assert all("ВВЕРХ" in text and "Вход:" in text for text in messages)
     assert all("Перевес модели слабый" in text for text in messages)
     assert all("Качество отбора" not in text for text in messages)
+    assert all("Вход:" in "\n".join(text.splitlines()[:5]) for text in messages)
     assert b.edit_message_text.call_args.kwargs["reply_markup"] == "idle_markup"
     assert repo.save_signal.await_count == 2
     assert repo.save_signal.call_args.args[0].model_version == "manual-v1"
@@ -332,7 +344,7 @@ async def test_data_wait_is_visible_and_not_described_as_a_market_entry(setup):
 
     m, p, b, repo, clock = setup
     m.inspect.side_effect = MarketDataError("1M: история догружается (0/120 свечей)")
-    m.progress[(1, 2)] = (7, "active", "idle")
+    m.progress[(1, 2)] = SearchPanel(7, "active", "idle")
     m.last_progress[(1, 2)] = 0
     b.edit_message_text = AsyncMock()
     await m._run(
@@ -411,7 +423,7 @@ async def test_unavailable_auto_group_has_bounded_warmup_before_trying_other_pai
 async def test_progress_keeps_updating_during_slow_data_fetch_and_stops_with_job(
     setup, monkeypatch
 ):
-    m, _, b, repo, _ = setup
+    m, _, b, repo, clock = setup
     monkeypatch.setattr("scanner.service.PROGRESS_INTERVAL_SECONDS", 0.01)
     waiting, updated = asyncio.Event(), asyncio.Event()
     calls = []
@@ -436,6 +448,7 @@ async def test_progress_keeps_updating_during_slow_data_fetch_and_stops_with_job
     )
     try:
         await asyncio.wait_for(waiting.wait(), 1)
+        clock.now += 1
         await asyncio.wait_for(updated.wait(), 1)
         assert all("Загружаю" in text for text in calls)
     finally:
@@ -474,6 +487,122 @@ async def test_manual_confirmation_uses_updated_direction_without_market_selecti
     await m._attempt((1, 2), SearchOptions(Expiration.MIN_3, pair=c.snapshot.pair), c)
     record = repo.save_signal.call_args.args[0]
     assert record.final_direction == "PUT" and record.model_version == "manual-v1"
-    final = b.send_message.call_args.args[1]
+    final = b.edit_message_text.call_args.kwargs["text"]
     assert "ВНИЗ" in final and "Направление обновлено" in final
     assert "Вход:" in final
+
+
+@pytest.mark.asyncio
+async def test_waiting_progress_cannot_overwrite_the_signal_card(setup):
+    m, _, b, _, _ = setup
+    options = SearchOptions(Expiration.MIN_3, pair=CurrencyPair("EURUSD"))
+    m.progress[(1, 2)] = SearchPanel(7, "active", "idle", options=options)
+    m.statuses[(1, 2)] = "Загружаю свечи"
+    editing, release = asyncio.Event(), asyncio.Event()
+    rendered = []
+
+    async def edit(**kwargs):
+        rendered.append(kwargs["text"])
+        if len(rendered) == 1:
+            editing.set()
+            await release.wait()
+
+    b.edit_message_text.side_effect = edit
+    progress = asyncio.create_task(m._show_progress((1, 2), options, force=True))
+    await asyncio.wait_for(editing.wait(), 1)
+    m.statuses[(1, 2)] = "Подготовка входа"
+    signal = asyncio.create_task(
+        m._notify((1, 2), "✅ EUR/USD · ВВЕРХ\nВход: 14:12:46")
+    )
+    release.set()
+    await asyncio.gather(progress, signal)
+    await m._show_progress((1, 2), options, active=False, force=True)
+    assert rendered[-1].startswith("✅ EUR/USD")
+    assert all(
+        call.kwargs["message_id"] == 7 for call in b.edit_message_text.call_args_list
+    )
+    assert b.edit_message_text.call_args.kwargs["reply_markup"] == "idle"
+    b.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_replacing_pair_keeps_one_card_and_cancels_the_old_plan(setup):
+    m, _, b, repo, _ = setup
+    waiting = asyncio.Event()
+
+    async def hold(seconds):
+        waiting.set()
+        await asyncio.Event().wait()
+
+    m.sleep = hold
+    first = SearchOptions(Expiration.MIN_3, pair=CurrencyPair("EURUSD"))
+    await m.start(1, 2, first, once=True, progress=(7, "active", "idle"))
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        old_task = m.tasks[(1, 2)]
+        old_panel = m.progress[(1, 2)]
+        waiting.clear()
+        await m.start(
+            1,
+            2,
+            replace(first, pair=CurrencyPair("GBPUSD")),
+            once=True,
+            progress=(7, "active", "idle"),
+        )
+        await asyncio.wait_for(waiting.wait(), 1)
+        assert old_task.cancelled()
+        assert "GBP/USD" in b.edit_message_text.call_args.kwargs["text"]
+        assert "EUR/USD" not in b.edit_message_text.call_args.kwargs["text"]
+        edits = b.edit_message_text.await_count
+        await m._show_progress((1, 2), first, force=True, expected=old_panel)
+        assert b.edit_message_text.await_count == edits
+    finally:
+        await m.stop(1, 2)
+    assert all(
+        call.kwargs["message_id"] == 7 for call in b.edit_message_text.call_args_list
+    )
+    b.send_message.assert_not_awaited()
+    repo.save_signal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deleted_card_is_replaced_once_and_following_updates_use_replacement(
+    setup,
+):
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import EditMessageText
+
+    m, _, b, _, _ = setup
+    m.progress[(1, 2)] = SearchPanel(7, "active", "idle")
+    missing = TelegramBadRequest(
+        method=EditMessageText(chat_id=1, message_id=7, text="test"),
+        message="Bad Request: message to edit not found",
+    )
+    b.edit_message_text.side_effect = [missing, Mock(), missing]
+    b.send_message.return_value = Mock(message_id=42)
+    await m._notify((1, 2), "📊 Анализ")
+    await m._notify((1, 2), "✅ Сигнал")
+    assert m.progress[(1, 2)].message_id == 42
+    assert b.edit_message_text.call_args.kwargs["message_id"] == 42
+    assert b.edit_message_text.call_args.kwargs["reply_markup"] == "active"
+    with pytest.raises(TelegramBadRequest):
+        await m._notify((1, 2), "Следующее обновление")
+    assert b.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_unchanged_card_is_a_successful_delivery_without_duplicate_message(setup):
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import EditMessageText
+
+    m, _, b, _, _ = setup
+    m.progress[(1, 2)] = SearchPanel(7, "active", "idle")
+    b.edit_message_text.side_effect = TelegramBadRequest(
+        method=EditMessageText(chat_id=1, message_id=7, text="test"),
+        message="Bad Request: message is not modified",
+    )
+    elapsed = await m._notify((1, 2), "✅ Сигнал")
+    assert elapsed >= 0
+    await m._notify((1, 2), "✅ Сигнал")
+    assert b.edit_message_text.await_count == 1
+    b.send_message.assert_not_awaited()

@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 
 from analysis.entry import (
     MANUAL_VERSION,
@@ -67,6 +67,18 @@ class SearchPolicy:
     timezone: str = "Asia/Bishkek"
 
 
+@dataclass
+class SearchPanel:
+    message_id: int
+    active_markup: object = None
+    idle_markup: object = None
+    body: str = ""
+    active: bool = True
+    restored: bool = False
+    rendered: tuple | None = None
+    options: SearchOptions | None = None
+
+
 class SearchManager:
     def __init__(
         self, provider, bot, repo, policy=None, *, clock=time.time, sleep=asyncio.sleep
@@ -80,6 +92,7 @@ class SearchManager:
         self.statuses = {}
         self.cooldowns = {}
         self.progress = {}
+        self.panel_locks = {}
         self.last_progress = {}
         self.checks = {}
         self.coverage = {}
@@ -112,7 +125,9 @@ class SearchManager:
         key = (chat, user)
         async with self.locks.setdefault(key, asyncio.Lock()):
             await self._stop(key)
-            self.progress[key] = progress
+            self.progress[key] = (
+                SearchPanel(*progress, options=options) if progress else None
+            )
             self.last_progress[key] = 0
             self.checks[key] = 0
             self.coverage[key] = (0, 0, 0)
@@ -125,57 +140,130 @@ class SearchManager:
         for key in list(self.tasks):
             await self.stop(*key)
 
-    async def _show_progress(self, key, options, *, active=True, force=False):
-        progress = self.progress.get(key)
-        if not progress or (
-            not force
-            and self.clock() - self.last_progress.get(key, 0)
-            < PROGRESS_INTERVAL_SECONDS
-        ):
-            return
-        message_id, active_markup, idle_markup = progress
-        self.last_progress[key] = self.clock()
-        mode = "Ручной сигнал" if options.mode == "manual" else "Автопоиск"
-        pair = (
-            f" · {options.pair.label}"
-            if options.mode == "manual" and options.pair
-            else ""
-        )
+    def _panel_text(self, key, panel):
+        options = panel.options
+        status = self.statuses.get(key, "")
         round_number, visited, total = self.coverage.get(key, (0, 0, 0))
         coverage = (
             f"\nОбход №{round_number}: {visited} из {total} пар."
-            if options.mode == "auto" and total
+            if options and options.mode == "auto" and total
             else ""
         )
-        text = (
-            f"{mode}{pair} · {options.expiration.label}\n\n{self.statuses[key]}"
-            f"\n\nОбновлено: {self._time(self.clock())}. Проверок: {self.checks.get(key, 0)}.{coverage}"
-        )
-        try:
-            await asyncio.wait_for(
-                self.bot.edit_message_text(
-                    chat_id=key[0],
-                    message_id=message_id,
-                    text=text,
-                    reply_markup=active_markup if active else idle_markup,
-                    parse_mode=None,
-                ),
-                timeout=2,
+        if panel.body:
+            text = panel.body
+            if (
+                options
+                and options.mode == "auto"
+                and text.startswith("✅")
+                and not status.startswith("Подготовка")
+            ):
+                text = "Последний сигнал\n\n" + text
+            if status and status not in text and not status.startswith("Подготовка"):
+                text += "\n\n" + status
+            text += coverage
+        else:
+            mode = "Ручной сигнал" if options.mode == "manual" else "Автопоиск"
+            pair = (
+                f" · {options.pair.label}"
+                if options.mode == "manual" and options.pair
+                else ""
             )
+            text = (
+                f"{mode}{pair} · {options.expiration.label}\n\n{status}"
+                f"\n\nОбновлено: {self._time(self.clock())}. Проверок: {self.checks.get(key, 0)}.{coverage}"
+            )
+        return text if len(text) <= 4000 else text[:3998] + "\n…"
+
+    async def _edit_panel(self, key, panel):
+        """Caller holds the panel lock; render the newest state after locking."""
+        text = self._panel_text(key, panel)
+        rendered = (text, panel.active)
+        if rendered == panel.rendered:
+            return
+        markup = panel.active_markup if panel.active else panel.idle_markup
+        try:
+            await self.bot.edit_message_text(
+                chat_id=key[0],
+                message_id=panel.message_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode=None,
+            )
+        except TelegramBadRequest as exc:
+            reason = str(exc).lower()
+            if "message is not modified" in reason:
+                pass
+            elif not panel.restored and (
+                "message to edit not found" in reason
+                or "message can't be edited" in reason
+            ):
+                message = await self.bot.send_message(
+                    key[0], text, reply_markup=markup, parse_mode=None
+                )
+                panel.message_id = message.message_id
+                panel.restored = True
+            else:
+                raise
+        panel.rendered = rendered
+
+    async def _show_progress(
+        self, key, options, *, active=None, force=False, expected=None
+    ):
+        panel = self.progress.get(key)
+        if (
+            not panel
+            or (expected is not None and panel is not expected)
+            or (
+                not force
+                and self.clock() - self.last_progress.get(key, 0)
+                < PROGRESS_INTERVAL_SECONDS
+            )
+        ):
+            return
+        self.last_progress[key] = self.clock()
+        try:
+            async with self.panel_locks.setdefault(key, asyncio.Lock()):
+                if self.progress.get(key) is not panel:
+                    return  # the user has already opened another card
+                panel.options = options
+                if active is not None:
+                    panel.active = active
+                await asyncio.wait_for(self._edit_panel(key, panel), timeout=2)
         except (TimeoutError, TelegramAPIError):
             logger.debug("Progress message could not be edited")
 
     async def _heartbeat(self, key, options):
+        panel = self.progress.get(key)
         while True:
             await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
-            await self._show_progress(key, options, force=True)
+            if self.progress.get(key) is not panel:
+                return
+            await self._show_progress(key, options, force=True, expected=panel)
 
-    async def _notify(self, key, text):
-        # Parse mode is explicitly plain text; broker symbols cannot inject HTML.
+    async def _notify(self, key, text, *, active=None):
+        # One card for loading, analysis, confirmation and cancellation. Include
+        # lock/API time in the delivery budget used by the entry checks.
         start = time.monotonic()
-        await asyncio.wait_for(
-            self.bot.send_message(key[0], text, parse_mode=None), timeout=10
-        )
+        async with self.panel_locks.setdefault(key, asyncio.Lock()):
+            panel = self.progress.get(key)
+            if panel is None:
+                panel = SearchPanel(
+                    0, body=text, active=active if active is not None else True
+                )
+                message = await asyncio.wait_for(
+                    self.bot.send_message(
+                        key[0], self._panel_text(key, panel), parse_mode=None
+                    ),
+                    timeout=10,
+                )
+                panel.message_id = message.message_id
+                panel.rendered = (self._panel_text(key, panel), panel.active)
+                self.progress[key] = panel
+            else:
+                panel.body = text
+                if active is not None:
+                    panel.active = active
+                await asyncio.wait_for(self._edit_panel(key, panel), timeout=10)
         return time.monotonic() - start
 
     async def _event(self, key, event, options, candidate=None, **details):
@@ -344,7 +432,9 @@ class SearchManager:
                         if once and not self.progress.get(key):
                             await self._notify(key, self.statuses[key])
                     if once and self.statuses[key].startswith("Вход зафиксирован"):
-                        self.statuses[key] = "Разовый план выполнен. Поиск остановлен"
+                        self.statuses[key] = (
+                            "Анализ завершён. Можно запросить следующий сигнал."
+                        )
                     await self._show_progress(key, options, active=not once, force=True)
                     logger.info(
                         "Search scan: round=%s coverage=%s/%s checks=%s status=%s",
@@ -381,6 +471,7 @@ class SearchManager:
                             "⛔ "
                             + pending.snapshot.pair.label
                             + ": запланированный вход отменён — поиск остановлен или настройки изменены",
+                            active=False,
                         ),
                         timeout=2,
                     )
@@ -396,7 +487,7 @@ class SearchManager:
                 "Поиск остановлен из-за ошибки; незавершённый план отменён. Откройте логи Docker"
             )
             try:
-                await self._notify(key, self.statuses[key])
+                await self._notify(key, self.statuses[key], active=False)
             except Exception:
                 logger.warning("Could not deliver search failure notification")
         finally:
@@ -409,7 +500,7 @@ class SearchManager:
     def _time(self, ts):
         return datetime.fromtimestamp(ts, self.tz).strftime("%d.%m %H:%M:%S")
 
-    def _summary(self, c):
+    def _summary(self, c, entry=None):
         r = c.result
         notes = [f"• [{n.timeframe.value}] {n.text}" for n in r.pros[:2]]
         if r.cons:
@@ -417,9 +508,14 @@ class SearchManager:
         return (
             f"💱 {r.pair.label} · {'ВВЕРХ' if c.direction == 'CALL' else 'ВНИЗ'}\n"
             f"⌛ Экспирация: {r.expiration.label}\n"
-            f"Текущая цена: {c.snapshot.price:.5f}\n"
             + (
-                "Ручной анализ\n"
+                f"🕒 Вход: {self._time(entry)} ({self.policy.timezone})\n"
+                if entry is not None
+                else ""
+            )
+            + f"Цена на момент анализа: {c.snapshot.price:.5f}\n"
+            + (
+                ""
                 if c.manual
                 else f"Качество отбора: {c.quality:.1f} балла (не вероятность выигрыша)\n"
             )
@@ -474,8 +570,8 @@ class SearchManager:
                 if options.mode == "manual"
                 else "🟡 ПРЕДВАРИТЕЛЬНО\n"
             )
-            + self._summary(c)
-            + f"\nВход: {self._time(entry)} ({self.policy.timezone})\n"
+            + self._summary(c, entry)
+            + "\n"
             + (
                 "Направление уточняется перед указанным временем входа.\n"
                 if options.mode == "manual"
@@ -522,13 +618,12 @@ class SearchManager:
                 if options.mode == "manual"
                 else "✅ ПЛАН ПОДТВЕРЖДЁН\n"
             )
-            + self._summary(fresh)
+            + self._summary(fresh, entry)
             + (
                 "\nНаправление обновлено после повторного анализа."
                 if options.mode == "manual" and fresh.direction != c.direction
                 else ""
             )
-            + f"\nВход: {self._time(entry)} ({self.policy.timezone})"
             + f"\nРасчётное завершение: {self._time(entry + expiration.value)}"
             + "\nПри пропуске времени не догоняйте движение.",
         )

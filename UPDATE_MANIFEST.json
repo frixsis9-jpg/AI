@@ -19,7 +19,7 @@
     },
     {
       "path": "SEARCH.md",
-      "sha256": "e6c2c563fdf2bc58184636bd074c3e910c5dca17adbb14d6acd70f37080cef71"
+      "sha256": "df0b1bb00049d0c46aee9b3278b32491388327d092b80400ce0d71a574aac417"
     },
     {
       "path": "requirements.txt",
@@ -51,7 +51,7 @@
     },
     {
       "path": "bot/handlers/selection.py",
-      "sha256": "d763df598945e3e1fbcb0977d3dc1dec5f3943943b1ef897044560ab3b118461"
+      "sha256": "4a31acabdafe055f1cace3ecb6a800988a1f0688d53b931dd48756126ada506f"
     },
     {
       "path": "bot/handlers/signal.py",
@@ -111,7 +111,7 @@
     },
     {
       "path": "scanner/service.py",
-      "sha256": "72a21a69523ccd4e6e12c8ba5d6c545c74c2d77031df474a564cd4393bba974f"
+      "sha256": "5be93e075670dec47e6a56866f777cd696ca84c2d4792512c8f13360a9246375"
     }
   ]
 }

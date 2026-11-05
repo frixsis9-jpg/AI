@@ -242,6 +242,7 @@ async def begin_search(callback, state, search, once=False):
         await callback.answer(str(exc), show_alert=True)
         return
     await callback.answer("Проверяю выбранную пару" if once else "Запускаю автопоиск")
+    await stop_search(callback, search)
     data = await state.get_data()
     text = (
         f"⏳ Проверяю {options.pair.label}, {options.expiration.label}. Загружаю свечи…"

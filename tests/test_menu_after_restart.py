@@ -103,7 +103,18 @@ async def test_old_keyboards_work_with_empty_state_and_across_submenus():
         await state.update_data(expiration="SEC_10", pair="EURUSD")
         await click("mode:auto")
         assert (await state.get_data())["expiration"] == "SEC_10"
+        order = []
+        search.stop.side_effect = lambda *args: order.append("stop")
+        search.start.side_effect = lambda *args, **kwargs: order.append("start")
+
+        async def record_edit(bot, method, **kwargs):
+            if isinstance(method, EditMessageText):
+                order.append("edit")
+            return True
+
+        session.side_effect = record_edit
         await click("search:start")
+        assert order == ["stop", "edit", "start"]
         assert search.start.call_args.args[2].mode == "auto"
         assert search.start.call_args.args[2].expiration.value == 10
         await click("pair:GBPUSD")
