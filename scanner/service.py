@@ -13,7 +13,14 @@ from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
 
-from analysis.entry import VERSION, EntryRejected, age_limit, evaluate
+from analysis.entry import (
+    MANUAL_VERSION,
+    VERSION,
+    EntryRejected,
+    age_limit,
+    evaluate,
+    evaluate_manual,
+)
 from analysis.errors import AnalysisError
 from analysis.multi_timeframe import timeframe_trio_for
 from domain import REGULAR_PAIRS, CurrencyPair, Expiration
@@ -29,6 +36,7 @@ ALLOWLIST = tuple(str(p) for p in REGULAR_PAIRS) + (
     "GBPJPY",
 )
 MARKETS = {"regular": "Обычные пары", "otc": "Только OTC", "both": "Обычные + OTC"}
+PROGRESS_INTERVAL_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -51,7 +59,7 @@ class SearchOptions:
 @dataclass(frozen=True)
 class SearchPolicy:
     interval: float = 5.0
-    rotation_seconds: float = 90.0
+    warmup_seconds: float = 20.0
     lead_seconds: float = 20.0
     confirm_before: float = 3.0
     cooldown_seconds: float = 60.0
@@ -74,6 +82,7 @@ class SearchManager:
         self.progress = {}
         self.last_progress = {}
         self.checks = {}
+        self.coverage = {}
         self.analysis_lock = asyncio.Lock()
 
     def status(self, chat, user):
@@ -106,6 +115,7 @@ class SearchManager:
             self.progress[key] = progress
             self.last_progress[key] = 0
             self.checks[key] = 0
+            self.coverage[key] = (0, 0, 0)
             self.statuses[key] = "Загружаю данные активных пар"
             self.tasks[key] = asyncio.create_task(
                 self._run(key, options, once), name=f"search:{chat}:{user}"
@@ -118,7 +128,9 @@ class SearchManager:
     async def _show_progress(self, key, options, *, active=True, force=False):
         progress = self.progress.get(key)
         if not progress or (
-            not force and self.clock() - self.last_progress.get(key, 0) < 15
+            not force
+            and self.clock() - self.last_progress.get(key, 0)
+            < PROGRESS_INTERVAL_SECONDS
         ):
             return
         message_id, active_markup, idle_markup = progress
@@ -129,9 +141,15 @@ class SearchManager:
             if options.mode == "manual" and options.pair
             else ""
         )
+        round_number, visited, total = self.coverage.get(key, (0, 0, 0))
+        coverage = (
+            f"\nОбход №{round_number}: {visited} из {total} пар."
+            if options.mode == "auto" and total
+            else ""
+        )
         text = (
             f"{mode}{pair} · {options.expiration.label}\n\n{self.statuses[key]}"
-            f"\n\nПоследняя проверка: {self._time(self.clock())}. Проверено ситуаций: {self.checks.get(key, 0)}."
+            f"\n\nОбновлено: {self._time(self.clock())}. Проверок: {self.checks.get(key, 0)}.{coverage}"
         )
         try:
             await asyncio.wait_for(
@@ -146,6 +164,11 @@ class SearchManager:
             )
         except (TimeoutError, TelegramAPIError):
             logger.debug("Progress message could not be edited")
+
+    async def _heartbeat(self, key, options):
+        while True:
+            await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
+            await self._show_progress(key, options, force=True)
 
     async def _notify(self, key, text):
         # Parse mode is explicitly plain text; broker symbols cannot inject HTML.
@@ -164,14 +187,15 @@ class SearchManager:
             **details,
         )
 
-    async def inspect(self, pair, expiration):
+    async def inspect(self, pair, expiration, *, manual=False):
         async with self.analysis_lock:
             snapshot = await asyncio.wait_for(
                 self.provider.get_snapshot(pair, timeframe_trio_for(expiration)),
                 timeout=45,
             )
             start = time.perf_counter()
-            candidate = await asyncio.to_thread(evaluate, snapshot, expiration)
+            evaluator = evaluate_manual if manual else evaluate
+            candidate = await asyncio.to_thread(evaluator, snapshot, expiration)
             # Recheck age AFTER computation and waiting for the worker thread.
             if self.clock() - snapshot.tick_time > age_limit(expiration):
                 raise MarketDataError("Котировка устарела во время расчёта")
@@ -193,9 +217,19 @@ class SearchManager:
         ]
 
     async def _run(self, key, options, once):
-        started = self.clock()
         pending = None
         cycles = 0
+        remaining, group = [], []
+        known, visited = set(), set()
+        round_number = 0
+        group_started = self.clock()
+        heartbeat = (
+            asyncio.create_task(
+                self._heartbeat(key, options), name=f"search-progress:{key}"
+            )
+            if self.progress.get(key)
+            else None
+        )
         try:
             await self._event(
                 key, "started", options, mode=options.mode, market=options.market
@@ -205,22 +239,37 @@ class SearchManager:
                     pairs = await asyncio.wait_for(self._pairs(options), timeout=30)
                     if not pairs:
                         raise MarketDataError("В выбранном списке нет активных пар")
-                    # A group is held long enough to fill live candle/tick caches.
                     size = max(1, self.provider.max_feeds)
-                    offset = (
-                        int((self.clock() - started) // self.policy.rotation_seconds)
-                        * size
-                    ) % len(pairs)
-                    group = (pairs + pairs)[offset : offset + min(size, len(pairs))]
+                    active = set(pairs)
+                    remaining = [p for p in remaining if p in active]
+                    group = [p for p in group if p in active]
+                    visited.intersection_update(active)
+                    remaining.extend(p for p in pairs if p not in known)
+                    known = active
+                    if not group:
+                        if not remaining:
+                            remaining = list(pairs)
+                            visited.clear()
+                            round_number += 1
+                        elif round_number == 0:
+                            round_number = 1
+                        group, remaining = remaining[:size], remaining[size:]
+                        group_started = self.clock()
+                    self.coverage[key] = (round_number, len(visited), len(pairs))
                     candidates = []
                     failures = []
+                    waiting_for_data = False
                     for pair in group:
                         self.statuses[key] = (
                             f"⏳ Загружаю и проверяю свечи {pair.label}…"
                         )
                         await self._show_progress(key, options, force=cycles == 0)
                         try:
-                            c = await self.inspect(pair, options.expiration)
+                            c = await self.inspect(
+                                pair,
+                                options.expiration,
+                                manual=options.mode == "manual",
+                            )
                             self.checks[key] = self.checks.get(key, 0) + 1
                             token = (
                                 key,
@@ -228,44 +277,48 @@ class SearchManager:
                                 options.expiration.value,
                                 c.direction,
                             )
-                            if self.clock() >= self.cooldowns.get(token, 0):
+                            if (
+                                options.mode == "manual"
+                                or self.clock() >= self.cooldowns.get(token, 0)
+                            ):
                                 candidates.append(c)
                         except (MarketDataError, AnalysisError, TimeoutError) as exc:
                             self.checks[key] = self.checks.get(key, 0) + 1
+                            warming = (
+                                not isinstance(exc, EntryRejected)
+                                or exc.retry_after > 0
+                            )
+                            waiting_for_data |= warming
                             prefix = (
                                 "Ситуация проверена, входа нет"
-                                if isinstance(exc, EntryRejected)
+                                if not warming
                                 else "Данные ещё не готовы"
                             )
                             reason = str(exc) or "источник данных не ответил вовремя"
                             detail = f"{prefix}. {pair.label}: {reason}"
-                            if (
-                                once
-                                and options.mode == "manual"
-                                and isinstance(exc, EntryRejected)
-                                and exc.result is not None
-                            ):
-                                r = exc.result
-                                bias = (
-                                    "ВВЕРХ" if r.final_direction == "CALL" else "ВНИЗ"
-                                )
-                                detail = (
-                                    f"Анализ выполнен. Смещение модели: {bias}.\nВход сейчас НЕ подтверждён.\nПричина: {reason}\n"
-                                    f"Таймфреймы согласны: {r.agreement}/{r.analyzed_count}."
-                                )
-                                detail += "\n" + "\n".join(
-                                    f"• [{n.timeframe.value}] {n.text}"
-                                    for n in r.pros[:2]
-                                )
                             failures.append(detail)
+                        finally:
+                            visited.add(pair)
+                            self.coverage[key] = (
+                                round_number,
+                                len(visited),
+                                len(pairs),
+                            )
                     if candidates:
                         selected = max(candidates, key=lambda c: c.quality)
                         # Another asset may have needed a slow history request.
                         # Never send a plan from the earlier, now stale snapshot.
-                        pending = await self.inspect(
-                            selected.snapshot.pair, options.expiration
+                        pending = (
+                            selected
+                            if options.mode == "manual"
+                            else await self.inspect(
+                                selected.snapshot.pair, options.expiration
+                            )
                         )
-                        if pending.direction != selected.direction:
+                        if (
+                            options.mode == "auto"
+                            and pending.direction != selected.direction
+                        ):
                             pending = None
                             raise MarketDataError(
                                 "Направление изменилось при сравнении пар; повторяю поиск"
@@ -277,13 +330,14 @@ class SearchManager:
                             options.expiration.value,
                             pending.direction,
                         )
-                        self.cooldowns[token] = self.clock() + max(
-                            self.policy.cooldown_seconds, options.expiration.value
-                        )
+                        if options.mode == "auto":
+                            self.cooldowns[token] = self.clock() + max(
+                                self.policy.cooldown_seconds, options.expiration.value
+                            )
                         pending = None
                     else:
                         self.statuses[key] = (
-                            failures[0]
+                            "\n\n".join(failures)
                             if failures
                             else "Повторный сигнал временно заблокирован"
                         )
@@ -292,6 +346,19 @@ class SearchManager:
                     if once and self.statuses[key].startswith("Вход зафиксирован"):
                         self.statuses[key] = "Разовый план выполнен. Поиск остановлен"
                     await self._show_progress(key, options, active=not once, force=True)
+                    logger.info(
+                        "Search scan: round=%s coverage=%s/%s checks=%s status=%s",
+                        round_number,
+                        len(visited),
+                        len(pairs),
+                        self.checks.get(key, 0),
+                        self.statuses[key],
+                    )
+                    if options.mode == "auto" and (
+                        not waiting_for_data
+                        or self.clock() - group_started >= self.policy.warmup_seconds
+                    ):
+                        group = []
                     cycles += 1
                     if once:
                         return
@@ -333,6 +400,9 @@ class SearchManager:
             except Exception:
                 logger.warning("Could not deliver search failure notification")
         finally:
+            if heartbeat:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
             if self.statuses.get(key, "").startswith("Подготовка"):
                 self.statuses[key] = "Поиск остановлен"
 
@@ -347,7 +417,12 @@ class SearchManager:
         return (
             f"💱 {r.pair.label} · {'ВВЕРХ' if c.direction == 'CALL' else 'ВНИЗ'}\n"
             f"⌛ Экспирация: {r.expiration.label}\n"
-            f"Качество отбора: {c.quality:.1f} балла (не вероятность выигрыша)\n"
+            f"Текущая цена: {c.snapshot.price:.5f}\n"
+            + (
+                "Ручной анализ\n"
+                if c.manual
+                else f"Качество отбора: {c.quality:.1f} балла (не вероятность выигрыша)\n"
+            )
             + "\n".join("• " + reason for reason in c.reasons)
             + ("\n" + "\n".join(notes) if notes else "")
             + f"\nРасчёт: {c.calculated_ms:.0f} мс"
@@ -366,6 +441,8 @@ class SearchManager:
             )
 
     async def _attempt(self, key, options, c):
+        if options.mode == "manual":
+            c = replace(c, manual=True)
         entry = math_ceil(self.clock() + self.policy.lead_seconds)
         lease = self.provider.pin(
             c.snapshot.pair, entry + options.expiration.value + 25
@@ -392,10 +469,18 @@ class SearchManager:
         )
         rtt = await self._notify(
             key,
-            "🟡 ПРЕДВАРИТЕЛЬНО\n"
+            (
+                "📊 РУЧНОЙ АНАЛИЗ\n"
+                if options.mode == "manual"
+                else "🟡 ПРЕДВАРИТЕЛЬНО\n"
+            )
             + self._summary(c)
             + f"\nВход: {self._time(entry)} ({self.policy.timezone})\n"
-            "Ожидайте подтверждения. При отмене или опоздании вход пропускается.\n"
+            + (
+                "Направление уточняется перед указанным временем входа.\n"
+                if options.mode == "manual"
+                else "Ожидайте подтверждения. При отмене или опоздании вход пропускается.\n"
+            )
             + (
                 "Секундный режим экспериментальный: задержка Telegram и ручного входа критична."
                 if expiration.is_short
@@ -410,12 +495,14 @@ class SearchManager:
             return
         await self.sleep(max(0, entry - self.policy.confirm_before - self.clock()))
         try:
-            fresh = await self.inspect(c.snapshot.pair, expiration)
+            fresh = await self.inspect(
+                c.snapshot.pair, expiration, manual=options.mode == "manual"
+            )
         except (MarketDataError, AnalysisError, TimeoutError) as exc:
             await self._cancel(key, options, c, str(exc))
             return
         atr = c.result.primary.indicators.atr
-        if (
+        if options.mode == "auto" and (
             fresh.direction != c.direction
             or abs(fresh.snapshot.price - c.snapshot.price)
             > atr * self.policy.max_drift_atr
@@ -430,11 +517,20 @@ class SearchManager:
             return
         rtt = await self._notify(
             key,
-            "✅ ПЛАН ПОДТВЕРЖДЁН\n"
+            (
+                "✅ РУЧНОЙ СИГНАЛ\n"
+                if options.mode == "manual"
+                else "✅ ПЛАН ПОДТВЕРЖДЁН\n"
+            )
             + self._summary(fresh)
+            + (
+                "\nНаправление обновлено после повторного анализа."
+                if options.mode == "manual" and fresh.direction != c.direction
+                else ""
+            )
             + f"\nВход: {self._time(entry)} ({self.policy.timezone})"
             + f"\nРасчётное завершение: {self._time(entry + expiration.value)}"
-            + f"\nОриентир цены: {fresh.snapshot.price:.5f}. При пропуске времени не догоняйте движение.",
+            + "\nПри пропуске времени не догоняйте движение.",
         )
         if rtt > budget or self.clock() > entry - 0.5:
             await self._cancel(key, options, c, "подтверждение задержалось")
@@ -452,9 +548,9 @@ class SearchManager:
             if price is not None:
                 break
             await self.sleep(0.05)
-        if (
-            price is None
-            or abs(price - fresh.snapshot.price) > atr * self.policy.max_drift_atr
+        if price is None or (
+            options.mode == "auto"
+            and abs(price - fresh.snapshot.price) > atr * self.policy.max_drift_atr
         ):
             await self._cancel(
                 key, options, c, "нет достоверной цены в момент входа или цена ушла"
@@ -466,13 +562,13 @@ class SearchManager:
             fresh.result.primary.timeframe,
             expiration,
             fresh.result.primary.confirmation.direction,
-            c.direction,
+            fresh.direction,
             None,
             False,
             price,
             fresh.result.primary.indicators,
             "Модельный вход по подтверждённому плану",
-            VERSION,
+            MANUAL_VERSION if options.mode == "manual" else VERSION,
             {
                 "quality": fresh.quality,
                 "raw_logit": fresh.result.logit,

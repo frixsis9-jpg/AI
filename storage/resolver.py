@@ -43,7 +43,8 @@ async def resolve_pending_signals(
     for signal in pending:
         late_by = (now - signal.expires_at).total_seconds()
         strict = bool(
-            signal.model_version and signal.model_version.startswith("entry-v1")
+            signal.model_version
+            and signal.model_version.startswith(("entry-v1", "manual-v1"))
         )
 
         # Preferred: the exact tick price at the expiration instant, from

@@ -240,6 +240,7 @@ class PocketOptionProvider(MarketDataProvider):
         self, pair: CurrencyPair, timeframes, output_size: int = 121
     ) -> MarketSnapshot:
         feed = await self._ensure_feed(pair)
+        feed.request_history(timeframes)
         deadline = time.monotonic() + 10
         while (
             not feed.closed
@@ -314,6 +315,7 @@ class PocketOptionProvider(MarketDataProvider):
         output_size: int = 150,
     ) -> list[Candle]:
         feed = await self._ensure_feed(pair)
+        feed.request_history([timeframe])
         base = timeframe.pocket_option_base
         candles = feed.candles(timeframe.seconds, base.period_seconds)
         if not candles:

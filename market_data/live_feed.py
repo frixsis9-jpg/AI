@@ -276,6 +276,9 @@ class AssetFeed:
         self.last_used_monotonic = time.monotonic()
         self.history_loaded = False
         self.backfill_attempted = asyncio.Event()
+        self.required_rows = {p: 0 for p in BASE_PERIODS}
+        self._history_requested = asyncio.Event()
+        self._history_revision = 0
         self._first_tick = asyncio.Event()
         self._repair_needed = asyncio.Event()
         self._reader: asyncio.Task | None = None
@@ -303,6 +306,24 @@ class AssetFeed:
         self._maintainer = asyncio.create_task(
             self._maintain(client, lock), name=f"history:{self.asset}"
         )
+
+    def request_history(self, timeframes, count=120):
+        """Load only the native depth needed by the requested analysis.
+
+        One extra aggregate covers the incomplete oldest bucket. Requirements
+        can grow if the same live subscription is later used for a longer expiry.
+        """
+        changed = False
+        for tf in timeframes:
+            period = tf.pocket_option_base.period_seconds
+            needed = min(MAX_ROWS[period], (count + 1) * (tf.seconds // period))
+            if needed > self.required_rows[period]:
+                self.required_rows[period] = needed
+                changed = True
+        if changed:
+            self._history_revision += 1
+            self.backfill_attempted.clear()
+            self._history_requested.set()
 
     async def _prime_recent_ticks(self, client, lock):
         """Warm the momentum window using genuine ticks, without treating a
@@ -404,28 +425,44 @@ class AssetFeed:
         return loaded
 
     async def _maintain(self, client, lock: asyncio.Lock) -> None:
-        """Deepen native OHLC history, then repair recent bars periodically."""
+        """Backfill requested timeframes and repair recent bars periodically."""
         try:
-            try:
-                for period in BASE_PERIODS:
-                    pages = (MAX_ROWS[period] + PAGE_ROWS - 1) // PAGE_ROWS
-                    await self._load_pages(client, lock, period, range(1, pages))
-            finally:
-                self.backfill_attempted.set()
-            logger.info(
-                "Feed %s history coverage: %s",
-                self.asset,
-                ", ".join(f"{p}s={len(self.series[p])}" for p in BASE_PERIODS),
-            )
-            # Repair any initial hole or partial bar; do not treat gaps as
-            # evidence of a universal broker delay.
             while not self.closed:
-                missing = any(len(series) < 120 for series in self.series.values())
+                self._history_requested.clear()
+                revision = self._history_revision
+                targets = dict(self.required_rows)
+                for period, needed in targets.items():
+                    if len(self.series[period]) < needed:
+                        pages = (needed + PAGE_ROWS - 1) // PAGE_ROWS
+                        await self._load_pages(client, lock, period, range(1, pages))
+                if revision != self._history_revision:
+                    continue  # a longer expiry was requested during the fetch
+                self.backfill_attempted.set()
+                logger.debug(
+                    "Feed %s requested history coverage: %s",
+                    self.asset,
+                    ", ".join(
+                        f"{p}s={len(self.series[p])}/{n}"
+                        for p, n in targets.items()
+                        if n
+                    ),
+                )
+                missing = any(len(self.series[p]) < n for p, n in targets.items())
                 delay = 5.0 if missing else REFRESH_SECONDS
+                repairs = asyncio.create_task(self._repair_needed.wait())
+                requested = asyncio.create_task(self._history_requested.wait())
                 try:
-                    await asyncio.wait_for(self._repair_needed.wait(), timeout=delay)
-                except TimeoutError:
-                    pass
+                    await asyncio.wait(
+                        (repairs, requested),
+                        timeout=delay,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for waiter in (repairs, requested):
+                        waiter.cancel()
+                    await asyncio.gather(repairs, requested, return_exceptions=True)
+                if self._history_requested.is_set():
+                    continue  # prioritize the new depth before periodic repairs
                 self._repair_needed.clear()
                 for period in BASE_PERIODS:
                     await self._load_pages(

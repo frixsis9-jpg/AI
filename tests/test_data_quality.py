@@ -121,11 +121,19 @@ def test_invalid_numeric_timestamps_are_rejected(snapshot_factory):
 
 
 @pytest.mark.asyncio
-async def test_real_feed_provider_backfills_all_timeframes_from_native_ohlc():
+@pytest.mark.parametrize(
+    "large,upgrade,expected_requests",
+    [(False, False, 5), (True, False, 12), (True, True, 14)],
+)
+async def test_real_feed_provider_backfills_only_requested_depth_from_native_ohlc(
+    monkeypatch, large, upgrade, expected_requests
+):
     from unittest.mock import Mock
 
     from domain import CurrencyPair
     from market_data.pocket_option import PocketOptionProvider
+
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_032.0)
 
     class Stream:
         def __init__(self):
@@ -165,16 +173,27 @@ async def test_real_feed_provider_backfills_all_timeframes_from_native_ohlc():
     client.get_candles_advanced = page
     provider = PocketOptionProvider("dummy", client=client)
     try:
+        requested = [Timeframe.M1, Timeframe.M5, Timeframe.M15]
+        if upgrade:
+            first = await asyncio.wait_for(
+                provider.get_snapshot(CurrencyPair("EURUSD"), requested), 3
+            )
+            first.validate(requested, max_age=2)
+            assert len(requests) == 5
+        if large:
+            requested.append(Timeframe.H1)
         snap = await asyncio.wait_for(
             provider.get_snapshot(
                 CurrencyPair("EURUSD"),
-                [Timeframe.M1, Timeframe.M5, Timeframe.M15, Timeframe.H1],
+                requested,
             ),
             3,
         )
         snap.validate(snap.candles, max_age=2)
         await asyncio.wait_for(provider._feeds["EURUSD"].backfill_attempted.wait(), 1)
-        assert len(requests) >= 3 + 2 + 1 + 10
+        assert len(requests) == expected_requests
+        assert sum(period == 15 for period, span, end in requests) == 1
+        assert sum(period == 60 for period, span, end in requests) == 1
         assert all(span == 150 * period for period, span, end in requests)
         assert all(end <= time.time() for period, span, end in requests)
     finally:

@@ -38,15 +38,16 @@ async def test_menu_settings_survive_restart_and_concurrent_updates(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["entry-v1", "manual-v1"])
 async def test_new_stats_separate_versions_and_never_fall_back_to_current_price(
-    tmp_path, candidate_factory
+    tmp_path, candidate_factory, version
 ):
     repo = SignalRepository(str(tmp_path / "signals.db"))
     await repo.init()
     c = candidate_factory()
     now = datetime.now(timezone.utc)
     record = SignalRecord(
-        now - timedelta(seconds=30),
+        now - timedelta(seconds=6),
         c.snapshot.pair,
         c.result.primary.timeframe,
         Expiration.SEC_5,
@@ -57,7 +58,7 @@ async def test_new_stats_separate_versions_and_never_fall_back_to_current_price(
         1.1,
         c.result.primary.indicators,
         "test",
-        "entry-v1",
+        version,
     )
     await repo.save_signal(record)
     provider = Mock()
@@ -67,7 +68,7 @@ async def test_new_stats_separate_versions_and_never_fall_back_to_current_price(
     await resolve_pending_signals(repo, provider, now)
     provider.get_candles.assert_not_awaited()
     rows = await repo.get_stats()
-    assert rows[0].unknown == 1 and rows[0].model_version == "entry-v1"
+    assert rows[0].unknown == 1 and rows[0].model_version == version
     await repo.save_signal(replace(record, model_version="v3-fitted", confidence=60))
     assert len(await repo.get_stats()) == 2
     await repo.aclose()

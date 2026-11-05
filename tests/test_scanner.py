@@ -47,8 +47,8 @@ def setup(candidate_factory):
     repo.save_signal = AsyncMock(return_value=7)
     manager = SearchManager(provider, bot, repo, clock=clock, sleep=clock.sleep)
 
-    async def inspect(pair, exp):
-        return candidate_factory(exp, clock(), str(pair))
+    async def inspect(pair, exp, *, manual=False):
+        return replace(candidate_factory(exp, clock(), str(pair)), manual=manual)
 
     manager.inspect = AsyncMock(side_effect=inspect)
     return manager, provider, bot, repo, clock
@@ -77,7 +77,7 @@ async def test_scheduled_entry_rechecks_and_records_target_not_notice_time(
 ):
     m, p, b, repo, clock = setup
     exp = Expiration(seconds)
-    options = SearchOptions(exp, pair=CurrencyPair("EURUSD"))
+    options = SearchOptions(exp, mode="auto", pair=CurrencyPair("EURUSD"))
     c = candidate_factory(exp, clock())
     notice_time = clock()
     await m._attempt((1, 2), options, c)
@@ -99,7 +99,9 @@ async def test_changed_direction_cancels_and_releases_lease(setup, candidate_fac
     c = candidate_factory(now=clock())
     m.inspect.side_effect = None
     m.inspect.return_value = candidate_factory(now=clock(), direction="PUT")
-    await m._attempt((1, 2), SearchOptions(Expiration.MIN_3, pair=c.snapshot.pair), c)
+    await m._attempt(
+        (1, 2), SearchOptions(Expiration.MIN_3, mode="auto", pair=c.snapshot.pair), c
+    )
     repo.save_signal.assert_not_awaited()
     p.release.assert_called_once_with("lease")
     assert "отменён" in b.send_message.call_args.args[1]
@@ -167,7 +169,7 @@ async def test_one_scan_uses_same_evaluator_ranks_candidates_and_suppresses_repe
 ):
     m, p, b, repo, clock = setup
 
-    async def inspect(pair, exp):
+    async def inspect(pair, exp, *, manual=False):
         return candidate_factory(
             exp, clock(), str(pair), quality=90 if pair == "GBPUSD" else 70
         )
@@ -212,7 +214,7 @@ async def test_comparing_pairs_refreshes_winner_before_sending_plan(
     m, p, b, repo, clock = setup
     calls = []
 
-    async def inspect(pair, exp):
+    async def inspect(pair, exp, *, manual=False):
         calls.append(str(pair))
         if len(calls) == 2:
             clock.now += 10
@@ -289,26 +291,39 @@ def test_message_keeps_existing_factor_explanations_without_claiming_probability
 
 
 @pytest.mark.asyncio
-async def test_manual_check_shows_why_no_entry_without_endless_wait(
-    setup, candidate_factory
+async def test_manual_check_reports_weak_direction_entry_time_and_allows_another_request(
+    setup, candidate_factory, monkeypatch
 ):
-    from analysis.entry import EntryRejected
-
     m, p, b, repo, clock = setup
     c = candidate_factory(now=clock())
-    m.inspect.side_effect = EntryRejected("Перевес слишком слабый", c.result)
+    weak = replace(c.result, logit=0.01, agreement=1)
+    monkeypatch.setattr("analysis.entry.analyze_multi_timeframe", lambda *args: weak)
+    monkeypatch.setattr(
+        "scanner.service.evaluate",
+        Mock(side_effect=AssertionError("Automatic filters used for manual report")),
+    )
+
+    async def snapshot(pair, timeframes):
+        return candidate_factory(now=clock(), pair=str(pair)).snapshot
+
+    p.get_snapshot = snapshot
+    del m.inspect
+    m.cooldowns[((1, 2), "EURUSD", 180, "CALL")] = clock() + 1000
     m.progress[(1, 2)] = (7, "active_markup", "idle_markup")
     m.last_progress[(1, 2)] = 0
     b.edit_message_text = AsyncMock()
-    await m._run(
-        (1, 2), SearchOptions(Expiration.MIN_3, pair=CurrencyPair("EURUSD")), True
-    )
-    text = b.edit_message_text.call_args.kwargs["text"]
-    assert "Анализ выполнен" in text and "НЕ подтверждён" in text
-    assert "Последняя проверка" in text
+    for _ in range(2):
+        await m._run(
+            (1, 2), SearchOptions(Expiration.MIN_3, pair=CurrencyPair("EURUSD")), True
+        )
+    messages = [call.args[1] for call in b.send_message.call_args_list]
+    assert len(messages) == 4
+    assert all("ВВЕРХ" in text and "Вход:" in text for text in messages)
+    assert all("Перевес модели слабый" in text for text in messages)
+    assert all("Качество отбора" not in text for text in messages)
     assert b.edit_message_text.call_args.kwargs["reply_markup"] == "idle_markup"
-    repo.save_signal.assert_not_awaited()
-    b.send_message.assert_not_awaited()
+    assert repo.save_signal.await_count == 2
+    assert repo.save_signal.call_args.args[0].model_version == "manual-v1"
 
 
 @pytest.mark.asyncio
@@ -327,3 +342,138 @@ async def test_data_wait_is_visible_and_not_described_as_a_market_entry(setup):
     assert "Данные ещё не готовы" in text and "0/120" in text
     assert "Ожидаю подходящий вход" not in text
     repo.save_signal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ready_auto_pairs_complete_a_round_without_ninety_second_holds(setup):
+    from analysis.entry import EntryRejected
+
+    m, p, _, repo, clock = setup
+    pairs = [
+        CurrencyPair(s)
+        for s in ("EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDCAD_otc", "GBPJPY_otc")
+    ]
+    p.list_active_pairs.return_value = pairs
+    calls = []
+    started = clock()
+
+    async def inspect(pair, exp, *, manual=False):
+        calls.append(pair)
+        raise EntryRejected("Перевес модели слабый")
+
+    async def pause(seconds):
+        await clock.sleep(seconds)
+        if set(calls) == set(pairs):
+            raise asyncio.CancelledError
+
+    m.inspect.side_effect = inspect
+    m.sleep = pause
+    with pytest.raises(asyncio.CancelledError):
+        await m._run((1, 2), SearchOptions(Expiration.MIN_3, "auto"), False)
+    assert calls == pairs
+    assert clock() - started < 30
+    assert m.coverage[(1, 2)] == (1, 6, 6)
+    repo.save_signal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_auto_group_has_bounded_warmup_before_trying_other_pairs(
+    setup,
+):
+    from analysis.entry import EntryRejected
+    from market_data.models import MarketDataError
+
+    m, p, _, _, clock = setup
+    pairs = [CurrencyPair(s) for s in ("EURUSD", "GBPUSD", "USDJPY", "USDCAD")]
+    p.list_active_pairs.return_value = pairs
+    arrived = {}
+    started = clock()
+
+    async def inspect(pair, exp, *, manual=False):
+        arrived.setdefault(pair, clock() - started)
+        if pair in pairs[:2]:
+            raise MarketDataError("история недоступна")
+        raise EntryRejected("Перевес модели слабый")
+
+    async def pause(seconds):
+        await clock.sleep(seconds)
+        if set(arrived) == set(pairs):
+            raise asyncio.CancelledError
+
+    m.inspect.side_effect = inspect
+    m.sleep = pause
+    with pytest.raises(asyncio.CancelledError):
+        await m._run((1, 2), SearchOptions(Expiration.MIN_3, "auto"), False)
+    assert arrived[pairs[2]] <= m.policy.warmup_seconds + m.policy.interval
+
+
+@pytest.mark.asyncio
+async def test_progress_keeps_updating_during_slow_data_fetch_and_stops_with_job(
+    setup, monkeypatch
+):
+    m, _, b, repo, _ = setup
+    monkeypatch.setattr("scanner.service.PROGRESS_INTERVAL_SECONDS", 0.01)
+    waiting, updated = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def edit(**kwargs):
+        calls.append(kwargs["text"])
+        if len(calls) >= 2:
+            updated.set()
+
+    async def inspect(*args, **kwargs):
+        waiting.set()
+        await asyncio.Event().wait()
+
+    b.edit_message_text = AsyncMock(side_effect=edit)
+    m.inspect.side_effect = inspect
+    await m.start(
+        1,
+        2,
+        SearchOptions(Expiration.MIN_3, pair=CurrencyPair("EURUSD")),
+        once=True,
+        progress=(7, "active", "idle"),
+    )
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        await asyncio.wait_for(updated.wait(), 1)
+        assert all("Загружаю" in text for text in calls)
+    finally:
+        await m.stop(1, 2)
+    assert not any(
+        t.get_name().startswith("search-progress:") for t in asyncio.all_tasks()
+    )
+    repo.save_signal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_confirmation_uses_updated_direction_without_market_selection_veto(
+    setup, candidate_factory
+):
+    m, p, b, repo, clock = setup
+    c = candidate_factory(now=clock())
+    fresh = candidate_factory(now=clock(), direction="PUT")
+    fresh = replace(
+        fresh,
+        manual=True,
+        snapshot=replace(
+            fresh.snapshot, price=c.snapshot.price + c.result.primary.indicators.atr * 3
+        ),
+    )
+
+    async def inspect(*args, **kwargs):
+        return replace(
+            fresh,
+            snapshot=replace(
+                fresh.snapshot, captured_at=clock(), tick_time=clock() - 0.1
+            ),
+        )
+
+    m.inspect.side_effect = inspect
+    p.price_at.return_value = fresh.snapshot.price
+    await m._attempt((1, 2), SearchOptions(Expiration.MIN_3, pair=c.snapshot.pair), c)
+    record = repo.save_signal.call_args.args[0]
+    assert record.final_direction == "PUT" and record.model_version == "manual-v1"
+    final = b.send_message.call_args.args[1]
+    assert "ВНИЗ" in final and "Направление обновлено" in final
+    assert "Вход:" in final

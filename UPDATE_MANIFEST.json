@@ -19,7 +19,7 @@
     },
     {
       "path": "SEARCH.md",
-      "sha256": "db55360104ad05a43b4d2123aab2c97ec03db7c8f4d5d07e1ceb8f6f1b03f666"
+      "sha256": "e6c2c563fdf2bc58184636bd074c3e910c5dca17adbb14d6acd70f37080cef71"
     },
     {
       "path": "requirements.txt",
@@ -39,7 +39,7 @@
     },
     {
       "path": "analysis/entry.py",
-      "sha256": "641ffcc00d844998b7a4dc6846b0f1449b0af165c217fc46a3be610554709f91"
+      "sha256": "ba98ae31458cc74f144abc890342df783f6350b0be4b017ebb3c99ae2b15f519"
     },
     {
       "path": "analysis/multi_timeframe.py",
@@ -71,15 +71,15 @@
     },
     {
       "path": "bot/rendering.py",
-      "sha256": "652e99e932fb3c01d700a8ff1b6722c9fa8f858ceba09f6f5c919833d56daf3a"
+      "sha256": "462375840f34029d0a841be9e5efcd2361b83d6b9228802b2cfe8b957fa86604"
     },
     {
       "path": "market_data/live_feed.py",
-      "sha256": "753ed71a3a0b0a0ed306eb2480b3110ecca32b4b47febf4e4821eb5b9252b870"
+      "sha256": "00baf452c5c4517f80d1e1c4cd6b895a9a159c8f508ef5296c89fde9b2b3cafa"
     },
     {
       "path": "market_data/pocket_option.py",
-      "sha256": "95177b7e78b05cbe9a3a6b21b4b84a99c315e472c7339b2921026a87284e431f"
+      "sha256": "a2ef28eacba38d815841c66969a00fbb401b0fa97e9765081d8477bfca9ea7ef"
     },
     {
       "path": "market_data/snapshot.py",
@@ -99,7 +99,7 @@
     },
     {
       "path": "storage/resolver.py",
-      "sha256": "28b201a5cd12009288998f964f7ed90ce9eafebc4538d8758d6a1849f8ac3834"
+      "sha256": "0c6953310bc111ce5b733a3b36b69fc4d74fda405ece81d84d758bb7c42af1bd"
     },
     {
       "path": "storage/fsm.py",
@@ -111,7 +111,7 @@
     },
     {
       "path": "scanner/service.py",
-      "sha256": "862e1dad796e7826fb12d232f6fd3d94ab7ef4f62254b8021064089c302f0952"
+      "sha256": "72a21a69523ccd4e6e12c8ba5d6c545c74c2d77031df474a564cd4393bba974f"
     }
   ]
 }

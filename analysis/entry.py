@@ -21,12 +21,14 @@ from market_data.snapshot import MarketSnapshot
 class EntryRejected(MarketDataError):
     """Inputs are ready, but entry conditions are not satisfied."""
 
-    def __init__(self, reason, result=None):
+    def __init__(self, reason, result=None, *, retry_after=0):
         super().__init__(reason)
         self.result = result
+        self.retry_after = retry_after
 
 
 VERSION = "entry-v1"
+MANUAL_VERSION = "manual-v1"
 
 
 def age_limit(expiration: Expiration) -> float:
@@ -48,10 +50,32 @@ class Candidate:
     quality: float  # ranking points, NEVER advertised as a win probability
     reasons: tuple[str, ...]
     calculated_ms: float = 0.0
+    manual: bool = False
 
     @property
     def direction(self):
         return self.result.final_direction
+
+
+def evaluate_manual(snapshot: MarketSnapshot, expiration: Expiration) -> Candidate:
+    """Return the existing model's direction, with weak factors as context.
+
+    Quote freshness and complete candle history remain required inputs.
+    Market selection gates belong to automatic search, not a manual report.
+    """
+    snapshot.validate(timeframe_trio_for(expiration), max_age=age_limit(expiration))
+    result = analyze_multi_timeframe(
+        snapshot.pair, expiration, snapshot.candles, snapshot.price
+    )
+    notes = [
+        f"Направление поддерживают {result.agreement}/{result.analyzed_count} таймфреймов"
+    ]
+    if result.agreement < 2:
+        notes.append("⚠ Таймфреймы противоречат друг другу")
+    if abs(result.logit) < 0.20:
+        notes.append("⚠ Перевес модели слабый")
+    notes.append(f"Возраст котировки {snapshot.age:.2f} с")
+    return Candidate(snapshot, result, 0, tuple(notes), manual=True)
 
 
 def evaluate(snapshot: MarketSnapshot, expiration: Expiration) -> Candidate:
@@ -61,8 +85,8 @@ def evaluate(snapshot: MarketSnapshot, expiration: Expiration) -> Candidate:
         snapshot.pair, expiration, snapshot.candles, snapshot.price
     )
 
-    def reject(reason):
-        return EntryRejected(reason, result)
+    def reject(reason, *, retry_after=0):
+        return EntryRejected(reason, result, retry_after=retry_after)
 
     if result.analyzed_count != 3 or result.agreement < 2:
         raise reject("Таймфреймы противоречат друг другу")
@@ -100,7 +124,10 @@ def evaluate(snapshot: MarketSnapshot, expiration: Expiration) -> Candidate:
         len(ticks) < (8 if expiration.is_short else 3)
         or ticks[-1][0] - ticks[0][0] < window * 0.5
     ):
-        raise reject("Поток ещё прогревается: недостаточно свежих тиков")
+        raise reject(
+            "Поток ещё прогревается: недостаточно свежих тиков",
+            retry_after=window * 0.5,
+        )
     movement = (ticks[-1][1] - ticks[0][1]) * sign
     if movement <= 0:
         raise reject("Последние тики не подтверждают направление")

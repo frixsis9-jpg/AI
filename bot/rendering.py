@@ -34,7 +34,7 @@ def render_menu_text(data):
         count = len(data.get("watchlist", []))
         text = f"🔎 Автопоиск\n\n⌛ Экспирация: {exp}\n🌐 Рынок: {market}\nПары: {str(count) + ' выбранных' if count else 'основной список'}\n\nНажмите «Начать автопоиск». Ход проверки появится здесь."
     else:
-        text = f"💱 Ручной сигнал\n\nПара: {pair.label if pair else 'не выбрана'}\n⌛ Экспирация: {exp}\n\nНажмите «Получить сигнал». Бот проверит именно эту пару."
+        text = f"💱 Ручной сигнал\n\nПара: {pair.label if pair else 'не выбрана'}\n⌛ Экспирация: {exp}\n\nНажмите «Получить сигнал»: бот покажет ВВЕРХ/ВНИЗ, цену и время входа по выбранной паре."
     if expiration and expiration.is_short:
         text += "\n\n5–30 секунд — экспериментальный режим."
     return text

@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from analysis.entry import age_limit, evaluate
+from analysis.entry import age_limit, evaluate, evaluate_manual
 from analysis.support_resistance import Level
 from domain import Expiration
 from market_data.models import MarketDataError
@@ -31,6 +31,10 @@ def test_weak_model_and_disagreement_are_rejected(candidate_factory, monkeypatch
         monkeypatch.setattr("analysis.entry.analyze_multi_timeframe", lambda *a: result)
         with pytest.raises(MarketDataError):
             evaluate(c.snapshot, c.result.expiration)
+        manual = evaluate_manual(c.snapshot, c.result.expiration)
+        assert manual.direction == result.final_direction
+        assert manual.manual
+        assert any("⚠" in reason for reason in manual.reasons)
 
 
 def test_ticks_and_current_price_are_gates_not_extra_probability_votes(
